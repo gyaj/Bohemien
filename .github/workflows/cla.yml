@@ -23,6 +23,6 @@ jobs:
           PERSONAL_ACCESS_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
         with:
           path-to-signatures: 'signatures/cla.json'
-          path-to-document: 'https://gist.github.com/gyaj/abc123def456...'
+          path-to-document: 'https://gist.github.com/gyaj/0371350d53126c91a79624d6b7b4b495'
           branch: 'main'
           allowlist: dependabot[bot]
