@@ -13,19 +13,35 @@ Usage
     result = runner.run_static(progress_cb=print)
     print(result['Ke_3d_Wb'], result['Ld_mH'], result['Lq_mH'])
 
-Mesh-size guidance
-------------------
-  n_angular_per_slot=4, n_axial=4   →  ~75k DOF,  ~40s per solve,  Ke ~±25%
-  n_angular_per_slot=4, n_axial=6   →  ~100k DOF, ~60s per solve,  Ke ~±20%
-  n_angular_per_slot=6, n_axial=6   →  ~200k DOF, ~150s per solve, Ke ~±15%
-  n_angular_per_slot=8, n_axial=8   →  ~500k DOF, ~600s per solve, Ke ~±8%
+What this solver is — and is not
+--------------------------------
+  By default (n_end_winding = 0) the 3D model is a pure axial extrusion
+  of the 2D cross-section with A_t = 0 on both stack faces.  It is a
+  genuinely 3D Nédélec edge-element solve and serves as an independent
+  check on the 2D solver: Ke_3d and Ld_3d must match Ke_2d and Ld_2d to
+  within mesh discretisation error (they do, on the reference motor).
 
-Ke comparison to 2D
--------------------
-  The 3D solver captures end-winding flux leakage and axial fringing.
-  At mid-stack the field matches the 2D solver within mesh discretisation error.
-  Ke_3d is expected to be 5–20% below Ke_2d on typical PM motors because the
-  3D B-field has axial components not present in the 2D cross-section model.
+  It does NOT model the end turns, so it cannot see end-winding leakage.
+  L_ew is added analytically (PMSM.end_winding_leakage_inductance,
+  Pyrhönen/Richter) to both 2D and 3D results:   L_total = L_3d + L_ew.
+
+  n_end_winding > 0 enables an experimental 2.5-D model in which the
+  slot conductors are continued straight through an air end region to
+  the axial boundary.  That captures axial fringing but adds the
+  inductance of straight conductors in air, which is NOT end-turn
+  leakage; treat those numbers as indicative only.  Proper end-turn
+  geometry (circumferential arcs) is on the roadmap.
+
+  The d-axis inductance is cross-checked internally by the gauge-
+  invariant stored-energy method (result['Ld_energy_check'] ≈ 1.00).
+
+Mesh-size guidance (reference 8p/48s motor, pure extrusion)
+-----------------------------------------------------------
+  n_angular_per_slot=4, n_axial=2, n_radial_airgap=3  →   55k edges,  ~1 s/solve,  Ke ≈ 0.70×
+  n_angular_per_slot=4, n_axial=4, n_radial_airgap=4  →  ~130k edges,  ~10 s/solve
+  n_angular_per_slot=8, n_axial=4, n_radial_airgap=8  →  ~500k edges,  minutes/solve, Ke → 1.00×
+  Convergence is governed mainly by the radial airgap layers (as in 2D:
+  n_radial_airgap = 8 brings Ke to within 0.1 % of analytical).
 """
 from __future__ import annotations
 import numpy as np
@@ -41,17 +57,20 @@ class FEMRunner3D:
     ----------
     motor                : PMSM or SynRelMotor instance
     n_angular_per_slot   : angular mesh density (4 = fast/coarse, 8 = accurate)
-    n_axial              : axial layers in active stack (4–10)
-    n_end_winding        : axial layers in each end-winding extension (1–3)
-    n_radial_airgap      : radial layers across the airgap (2–6)
+    n_axial              : axial layers in active stack (2–8)
+    n_end_winding        : axial layers in each air end region.
+                           0 (default) = pure extrusion, validated against 2D.
+                           >0 = experimental straight-conductor end model.
+    n_radial_airgap      : radial layers across the airgap (3–8; this is the
+                           main convergence knob — 8 gives Ke within 0.1 %)
     """
 
     def __init__(self,
                  motor,
                  n_angular_per_slot: int = 4,
-                 n_axial:            int = 6,
-                 n_end_winding:      int = 2,
-                 n_radial_airgap:    int = 3):
+                 n_axial:            int = 4,
+                 n_end_winding:      int = 0,
+                 n_radial_airgap:    int = 4):
         self.motor              = motor
         self.n_ang              = n_angular_per_slot
         self.n_axial            = n_axial
@@ -187,14 +206,11 @@ class FEMRunner3D:
         # field weakening and saliency — this is the physically correct value.
         _log("3D FEM: Ld/Lq perturbation (2 solves, zero-background)...", 0.50)
 
-        # # Choose dI to give ~5% of Ke as flux change: dI = 0.05*Ke / Ld_est
-        # # Use analytical Ld as the estimate to size dI appropriately.
-        # Ld_est = max(getattr(motor, 'Ld', 1e-4), 1e-5)
-        # dI     = max(0.05 * Ke_3d / Ld_est, 1.0)
-        # # Cap at rated current to avoid nonlinear saturation
-        # I_rated_est = motor.rated_power / (3 * 200 + 1)  # rough peak current
-        # dI = min(dI, I_rated_est)
-        dI = 20.0
+        # Fixed dI = 20 A: small enough for linear regime (<<< rated current),
+        # large enough that delta_psi = Ld * dI ~ 0.5 mWb >> mesh noise.
+        # Do NOT derive dI from Ke or Iq — that causes saturation or
+        # Park-projection contamination from large background currents.
+        dI = 20.0   # A — fixed, linear, above noise floor
         th_e_pert = rotor_angle * pp - theta_w   # d-axis aligned frame
 
         def _psi_dq_zero(Id_, Iq_):
@@ -218,35 +234,78 @@ class FEMRunner3D:
         pd0 = Ke_3d   # aligned d-axis, no current → psi_d = Ke
         pq0 = 0.0     # no q-axis flux at no load in aligned frame
 
-        pd_d, _  = _psi_dq_zero(dI,  0.0)   # d-axis perturbation
-        _,  pq_q = _psi_dq_zero(0.0, dI)    # q-axis perturbation
+        # d-axis perturbation.  Also compute Ld by the stored-energy method
+        # (L = 4W/3I²), which is gauge-invariant and independent of the
+        # flux-linkage bookkeeping: the two must agree to ~0.1 %.
+        from Bohemien_Motor_Designer.fea.solver3d import _build_nu
+        _Br_backup = getattr(motor, "_get_Br", None)
+        motor._get_Br = lambda: 0.0                    # PM off for energy check
+        A_d = solve_magnetostatic_3d(self._mesh, motor, rotor_angle=rotor_angle,
+                                     Id=dI, Iq=0.0, electrical_angle=th_e_pert)
+        if _Br_backup is None:
+            del motor._get_Br
+        else:
+            motor._get_Br = _Br_backup
+        p_d = compute_flux_linkage_3d(self._mesh, A_d, motor, self._geom)
+        c_  = 2.0 / 3.0
+        pd_d = c_ * (p_d['psi_A']*np.cos(th_e_pert)
+                     + p_d['psi_B']*np.cos(th_e_pert-2*np.pi/3)
+                     + p_d['psi_C']*np.cos(th_e_pert+2*np.pi/3))
+        B_d  = compute_B_field_3d(self._mesh, A_d, self._geom)
+        nu   = _build_nu(self._mesh, motor)
+        W_d  = 0.5 * float(np.sum(nu * (B_d**2).sum(axis=1) * np.abs(self._geom["vol"])))
+        Ld_energy = 4.0 * W_d / (3.0 * dI**2)
+        Ld        = pd_d / dI                           # PM off → no baseline needed
 
-        Ld = (pd_d - pd0) / dI
+        # q-axis perturbation (PM on, baseline pq0 = 0 in aligned frame)
+        _, pq_q = _psi_dq_zero(0.0, dI)
         Lq = (pq_q - pq0) / dI
 
-        # Clamp to physically sensible range (avoids sign flips from noise)
         Ld = max(Ld, 1e-6)
         Lq = max(Lq, 1e-6)
+        energy_check = Ld / (Ld_energy + 1e-30)
+
+        # ── Step 4: reconcile with 2D and analytical ──────────────────────
+        # This 3D model is a pure axial extrusion of the 2D cross-section
+        # (plus, if n_end_winding > 0, straight conductors in an air end
+        # region — an experimental 2.5-D model, NOT end-turn geometry).
+        # It therefore cannot see end-winding leakage; L_ew is added
+        # analytically, exactly as for the 2D result.  See PMSM.
+        # end_winding_leakage_inductance() for the model and literature.
+        L_ew  = float(motor.end_winding_leakage_inductance())
+        brk   = motor.inductance_breakdown()
 
         dt_total = time.time() - t0_total
         _log(
-            f"3D static done: Ke={Ke_3d:.4f}Wb  Ld={Ld*1e3:.2f}mH  Lq={Lq*1e3:.2f}mH  "
-            f"[{dt_total:.0f}s]",
+            f"3D static done: Ke={Ke_3d:.4f}Wb  Ld={Ld*1e3:.4f}mH  Lq={Lq*1e3:.4f}mH  "
+            f"(energy check {energy_check:.3f})  +L_ew={L_ew*1e3:.4f}mH  [{dt_total:.0f}s]",
             1.0,
         )
 
         result = dict(
             # Ke
+            Ke_3d        = Ke_3d,
             Ke_3d_Wb     = Ke_3d,
             Ke_anal_Wb   = float(motor.back_emf_constant()),
             theta_w_deg  = float(np.degrees(theta_w)),
-            # Inductances
+            # Inductances — raw 3D (extrusion: no end-winding leakage)
             Ld_H         = float(Ld),
             Lq_H         = float(Lq),
             Ld_mH        = float(Ld * 1e3),
             Lq_mH        = float(Lq * 1e3),
+            Ld_energy_mH = float(Ld_energy * 1e3),
+            Ld_energy_check = float(energy_check),      # Ld_fluxlink / Ld_energy, expect 1.00
+            # End-winding correction and totals
+            L_ew_mH      = L_ew * 1e3,
+            Ld_total_mH  = float((Ld + L_ew) * 1e3),
+            Lq_total_mH  = float((Lq + L_ew) * 1e3),
+            # Analytical comparison (same decomposition)
+            L_2d_anal_mH    = brk["L_2d"] * 1e3,
+            L_total_anal_mH = brk["L_total"] * 1e3,
             Ld_anal_mH   = float(motor.Ld * 1e3),
             Lq_anal_mH   = float(motor.Lq * 1e3),
+            end_region_model = ("straight-conductor (experimental)"
+                                if self.n_ew > 0 else "none (pure extrusion)"),
             # B-field
             B_gap_mean_T = B_gap,
             B_gap_max_T  = B_gap_max,

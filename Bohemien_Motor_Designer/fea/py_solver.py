@@ -225,11 +225,15 @@ def _build_J_winding(mesh, motor, Id, Iq, electrical_angle):
 
     sp     = motor.stator.slot_profile if motor.stator else None
     A_slot = sp.area() if sp else 1e-4
-    ff     = getattr(motor, "slot_fill_factor", 0.45)
     N_coil = getattr(motor, "turns_per_coil", 10)
     n_lay  = motor.winding.layers if motor.winding else 2
     A_coil = A_slot / n_lay
-    J_scale = N_coil / (A_coil * ff + 1e-12)
+    # J is applied uniformly over the WHOLE meshed slot-layer area (copper +
+    # insulation + air), so the ampere-turns it must carry are N_coil·I and
+    # J = N_coil·I / A_layer.  Dividing by the fill factor here would inject
+    # N_coil·I/ff ampere-turns (≈2× too many at ff≈0.48).  ff only matters
+    # for the copper current density used in loss/thermal calculations.
+    J_scale = N_coil / (A_coil + 1e-12)
 
     for coil in mesh.coil_data:
         J[coil["elem_idx"]] = coil["direction"] * i_phase[coil["phase"]] * J_scale

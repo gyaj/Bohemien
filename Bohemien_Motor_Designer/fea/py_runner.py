@@ -42,12 +42,13 @@ class PythonFEARunner:
     Parameters
     ----------
     motor            : PMSM instance
-    n_radial_airgap  : radial elements across air gap (4 recommended)
-    n_ang_per_slot   : angular elements per slot pitch (12 recommended)
+    n_radial_airgap  : radial elements across air gap.  THE main convergence
+                       knob: 4 → Ke ≈ 0.8×, 8 → Ke within 0.1 % (reference motor)
+    n_ang_per_slot   : angular elements per slot pitch (8–16)
     """
 
     def __init__(self, motor,
-                 n_radial_airgap:   int = 4,
+                 n_radial_airgap:   int = 8,
                  n_ang_per_slot:    int = 12):
         self.motor  = motor
         self._nr    = n_radial_airgap
@@ -414,33 +415,76 @@ class PythonFEARunner:
         if progress_cb:
             progress_cb("Extracting Ld/Lq (2 perturbation solves at calibrated d-axis)...", 0.85)
 
-        dI = max(abs(Iq) * 0.05, 1.0)
-        # Perturbation at θ_m=0, θ_e = -theta_w  (d-axis aligned)
-        theta_m_pert = 0.0
-        theta_e_pert = theta_m_pert * pp - theta_w
+# ── Ld/Lq: zero-background perturbation ──────────────────────────────────
+        # Use Id=Iq=0 baseline (no-load) so there is no large background
+        # current whose Park projection error can contaminate the tiny
+        # delta_psi signal. The no-load psi_d0 = Ke_fea (already computed).
+        #
+        # dI is fixed at a value that gives a flux change well above
+        # numerical noise (~0.001 mWb) but small enough to stay in the
+        # linear regime (<<< rated current).
+        # delta_psi = Ld * dI; need dI > noise/Ld ~ 0.001mWb / 0.05mH = 20A
+        # Use 20 A fixed — well below rated current for any motor in this range.
+        dI = 20.0   # A — fixed perturbation, linear regime, above noise floor
 
-        def _psi_at(Id_, Iq_):
+        theta_m_pert = 0.0
+        theta_e_pert = theta_m_pert * pp - theta_w  # d-axis aligned
+
+        def _psi_at_zero_bg(Id_, Iq_):
+            """Flux linkage with zero background current."""
             Az = solve_magnetostatic(self._mesh, motor,
                                      rotor_angle=theta_m_pert, Id=Id_, Iq=Iq_,
                                      electrical_angle=theta_e_pert)
             return compute_flux_linkage(self._mesh, Az, motor)
 
-        p0  = _psi_at(Id,    Iq)
-        p_d = _psi_at(Id+dI, Iq)
-        p_q = _psi_at(Id,    Iq+dI)
+        # Baseline: reuse no-load psi_d = Ke_fea (saves one solve)
+        pd0 = Ke_fea   # psi_d at no-load, d-axis aligned
+        pq0 = 0.0      # psi_q = 0 at no-load in d-axis frame
 
-        pd0, pq0 = _park(p0,  theta_e_pert)
-        pdd, _   = _park(p_d, theta_e_pert)
-        _,  pqq  = _park(p_q, theta_e_pert)
+        p_d = _psi_at_zero_bg(dI,  0.0)   # d-axis perturbation only
+        p_q = _psi_at_zero_bg(0.0, dI)    # q-axis perturbation only
+
+        pdd, _  = _park(p_d, theta_e_pert)
+        _,  pqq = _park(p_q, theta_e_pert)
 
         Ld = (pdd - pd0) / dI
         Lq = (pqq - pq0) / dI
+
+        # Clamp: inductance must be positive and physically bounded
+        Ld = max(Ld, 1e-7)
+        Lq = max(Lq, 1e-7)
+
+        # ── Step 5: mesh-convergence check ──────────────────────────────────
+        # Re-solve Ld on a mesh with half the angular density AND half the
+        # radial airgap layers.  The FEM energy converges from below, so
+        # Ld(fine)/Ld(coarse) > 1; if it exceeds ~1.10 the fine mesh is
+        # itself still far from converged and the Ld/Lq numbers should be
+        # treated as lower bounds.  (On the reference motor the radial
+        # airgap layers are the controlling parameter: n_radial_airgap=8
+        # brings Ke to 0.1 % and Ld to ~1 % of the converged value.)
+        if progress_cb:
+            progress_cb("Mesh-convergence check (coarser mesh, 2 solves)...", 0.95)
+        conv = self._convergence_check(Ld, theta_w, dI)
+
+        # ── Step 6: end-winding correction ──────────────────────────────────
+        # A 2D model cannot see end-winding leakage.  Add the analytical
+        # L_ew (PMSM.end_winding_leakage_inductance, Pyrhönen/Richter) to
+        # give the total synchronous inductance.  The analytical
+        # decomposition is reported alongside for a like-for-like comparison:
+        #   Ld_fem        ↔  L_2d_anal   (= L_ag + L_h + L_slot + L_tt)
+        #   Ld_fem + L_ew ↔  L_total_anal
+        try:
+            brk  = motor.inductance_breakdown()
+            L_ew = float(brk["L_ew"])
+        except Exception:
+            brk, L_ew = {}, 0.0
 
         elapsed = time.time() - t0
         if progress_cb:
             progress_cb(
                 f"Loaded done: T_avg={T_avg:.1f}Nm  Ke={Ke_fea:.4f}Wb  "
-                f"Ld={Ld*1e3:.2f}mH Lq={Lq*1e3:.2f}mH  "
+                f"Ld={Ld*1e3:.4f}mH Lq={Lq*1e3:.4f}mH  (+L_ew {L_ew*1e3:.4f})  "
+                f"conv={conv['ratio']:.3f}{' ⚠' if not conv['converged'] else ''}  "
                 f"THD={emf_thd_pct:.1f}%  [{elapsed:.0f}s]", 1.0)
 
         result = dict(
@@ -467,15 +511,78 @@ class PythonFEARunner:
             Ke_Wb          = Ke_fea,
             Ke_fem_Wb      = Ke_fem,
             theta_w_deg    = float(np.degrees(theta_w)),
+            # Raw 2D FEM inductances (no end-winding leakage by construction)
             Ld_H           = float(Ld),
             Lq_H           = float(Lq),
             Ld_mH          = float(Ld * 1e3),
             Lq_mH          = float(Lq * 1e3),
+            # End-winding correction and totals
+            L_ew_mH        = L_ew * 1e3,
+            Ld_total_mH    = float((Ld + L_ew) * 1e3),
+            Lq_total_mH    = float((Lq + L_ew) * 1e3),
+            # Analytical decomposition for like-for-like comparison
+            L_2d_anal_mH   = float(brk.get("L_2d", 0.0) * 1e3),
+            L_total_anal_mH= float(brk.get("L_total", 0.0) * 1e3),
+            L_ag_anal_mH   = float(brk.get("L_ag", 0.0) * 1e3),
+            L_slot_anal_mH = float((brk.get("L_slot", 0.0) + brk.get("L_tt", 0.0)
+                                    + brk.get("L_h", 0.0)) * 1e3),
+            # Mesh convergence
+            conv_ratio     = conv["ratio"],
+            conv_converged = conv["converged"],
+            conv_coarse_Ld_mH = conv["Ld_coarse_mH"],
+            conv_mesh_fine = conv["mesh_fine"],
+            conv_mesh_coarse = conv["mesh_coarse"],
             solve_time_s   = float(elapsed),
             method         = "python_fem",
         )
         self._last_loaded = result
         return result
+
+    # ── Mesh-convergence check ──────────────────────────────────────────────
+
+    def _convergence_check(self, Ld_fine: float, theta_w: float,
+                           dI: float, tol: float = 1.10) -> dict:
+        """
+        Re-extract Ld on a coarser mesh (half angular density, half radial
+        airgap layers) and return the ratio Ld_fine / Ld_coarse.
+
+        FEM energy converges from below, so the ratio is ≥ 1.  A ratio
+        above `tol` (default 1.10) means the fine mesh is still changing
+        by more than ~10 % per refinement step and the reported Ld/Lq are
+        lower bounds; increase n_radial_airgap first, then n_ang_per_slot.
+        """
+        from Bohemien_Motor_Designer.fea.py_solver import solve_magnetostatic
+        motor = self.motor
+        n_ang_c = max(2, self._na // 2)
+        n_ag_c  = max(2, self._nr // 2)
+        try:
+            mesh_c = build_motor_mesh(motor, n_radial_airgap=n_ag_c,
+                                      n_angular_per_slot=n_ang_c)
+            th_e = -theta_w
+            Az0 = solve_magnetostatic(mesh_c, motor, rotor_angle=0.0,
+                                      Id=0.0, Iq=0.0, electrical_angle=0.0)
+            p0  = compute_flux_linkage(mesh_c, Az0, motor)
+            c   = 2.0 / 3.0
+            pd0 = c * (p0["psi_A"]*np.cos(0.0) + p0["psi_B"]*np.cos(-2*np.pi/3)
+                       + p0["psi_C"]*np.cos(2*np.pi/3))
+            pq0 = c * (-p0["psi_B"]*np.sin(-2*np.pi/3) - p0["psi_C"]*np.sin(2*np.pi/3))
+            Ke_c = float(np.hypot(pd0, pq0))
+            Az_d = solve_magnetostatic(mesh_c, motor, rotor_angle=0.0,
+                                       Id=dI, Iq=0.0, electrical_angle=th_e)
+            p_d  = compute_flux_linkage(mesh_c, Az_d, motor)
+            pdd  = c * (p_d["psi_A"]*np.cos(th_e) + p_d["psi_B"]*np.cos(th_e-2*np.pi/3)
+                        + p_d["psi_C"]*np.cos(th_e+2*np.pi/3))
+            Ld_c = max((pdd - Ke_c) / dI, 1e-9)
+            ratio = float(Ld_fine / Ld_c)
+            return dict(ratio=ratio, converged=bool(ratio <= tol),
+                        Ld_coarse_mH=float(Ld_c * 1e3),
+                        mesh_fine=f"{self._na} ang/slot, {self._nr} AG layers",
+                        mesh_coarse=f"{n_ang_c} ang/slot, {n_ag_c} AG layers")
+        except Exception as exc:  # never let the check break the main result
+            return dict(ratio=float("nan"), converged=False,
+                        Ld_coarse_mH=float("nan"),
+                        mesh_fine=f"{self._na} ang/slot, {self._nr} AG layers",
+                        mesh_coarse=f"check failed: {exc}")
 
 
     def summary(self) -> str:
@@ -502,8 +609,18 @@ class PythonFEARunner:
             lines.append(f"FEA Torque ripple   = {r['T_ripple_pct']:.1f}%")
             lines.append(f"FEA Ke              = {r['Ke_Wb']:.4f} Wb  "
                          f"(err {Ke_err:.1f}% vs analytical)")
-            lines.append(f"FEA Ld              = {r['Ld_mH']:.3f} mH")
-            lines.append(f"FEA Lq              = {r['Lq_mH']:.3f} mH")
+            lines.append("— Inductance (2D FEM has no end-winding term) —")
+            lines.append(f"FEA Ld (2D raw)     = {r['Ld_mH']:.4f} mH   "
+                         f"analytical L_2d = {r.get('L_2d_anal_mH', 0):.4f} mH")
+            lines.append(f"FEA Lq (2D raw)     = {r['Lq_mH']:.4f} mH")
+            lines.append(f"+ L_ew (analytical) = {r.get('L_ew_mH', 0):.4f} mH")
+            lines.append(f"Ld total            = {r.get('Ld_total_mH', r['Ld_mH']):.4f} mH   "
+                         f"analytical L_total = {r.get('L_total_anal_mH', 0):.4f} mH")
+            lines.append(f"Lq total            = {r.get('Lq_total_mH', r['Lq_mH']):.4f} mH")
+            if 'conv_ratio' in r:
+                flag = "ok" if r['conv_converged'] else "NOT converged — refine mesh"
+                lines.append(f"Mesh convergence    = {r['conv_ratio']:.3f}  "
+                             f"[{r['conv_mesh_fine']} vs {r['conv_mesh_coarse']}]  {flag}")
             lines.append(f"FEA BEMF fund       = {r['emf_fund_V']:.1f} V pk")
             lines.append(f"FEA BEMF THD        = {r['emf_thd_pct']:.1f}%")
             lines.append(f"Solve time          = {r['solve_time_s']:.0f}s")

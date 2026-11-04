@@ -49,13 +49,32 @@ from typing import Optional
 TAG_STATOR_IRON = 1
 TAG_ROTOR_IRON  = 2
 TAG_PM_BASE     = 3
-TAG_END_WINDING = 500
+TAG_END_WINDING = 500      # end-region AIR (everything outside the stack that
+                           # is not a continued conductor).  Name kept for
+                           # backward compatibility with mesh summaries.
+TAG_END_COIL    = 600      # base: slot conductor continued axially past the
+                           # stack face (600 + slot*2 + layer)
 
 def _pm_tag(pole: int) -> int:       return TAG_PM_BASE + pole
 def _shaft_tag(poles: int) -> int:   return TAG_PM_BASE + poles
 def _airgap_tag(poles: int) -> int:  return TAG_PM_BASE + poles + 1
+def _rotor_air_tag(poles: int) -> int: return TAG_PM_BASE + poles + 2
 def _winding_tag(slot: int, layer: int, Qs: int) -> int:
     return 200 + (slot % Qs) * 2 + layer
+def _end_coil_tag(slot: int, layer: int, Qs: int) -> int:
+    return TAG_END_COIL + (slot % Qs) * 2 + layer
+
+# End-region modelling note
+# -------------------------
+# The real end turn leaves the stack, bends circumferentially and re-enters
+# another slot.  Meshing that loop is a separate project.  Here the slot
+# conductors are continued *straight* through the end region to the axial
+# boundary, so the current source is divergence-free inside the domain, and
+# everything else outside the stack is air.  This is the standard "2.5-D"
+# model: it captures axial fringing at the stack faces but NOT end-winding
+# leakage.  L_ew is therefore added analytically (PMSM.end_winding_leakage_
+# inductance) to both the 2D and 3D results, and the expected unit-test
+# relation is   Ld_3D ≈ Ld_2D  to within a few percent.
 
 # 5-tet Freudenthal decomposition of a hexahedron.
 # Hex corner numbering:
@@ -67,6 +86,24 @@ HEX_TO_TET_5 = np.array([
     [4, 1, 5, 6],   # tet 2
     [4, 3, 6, 7],   # tet 3
     [3, 1, 4, 6],   # tet 4  (centre)
+], dtype=np.int32)
+
+# Mirror image of HEX_TO_TET_5 (reflected in the angular direction, node
+# order adjusted so every tet keeps positive volume).  Its face diagonals
+# are the complementary set: on each of the six hex faces it uses the
+# OTHER diagonal.  The two templates must be applied in a checkerboard
+# pattern, parity = (ir + it + iz) mod 2, so that any two neighbouring
+# hexes put the same diagonal on their shared face.  Using a single
+# template everywhere leaves ~75 % of interior faces unshared ("cracks"):
+# the edge-element space is then non-conforming, the field leaks across
+# the cracks, and current-driven inductances come out 25–30 % high and
+# grow with mesh refinement.  (Verified on the reference motor.)
+HEX_TO_TET_5_MIRROR = np.array([
+    [0, 1, 5, 2],
+    [3, 0, 7, 2],
+    [5, 0, 7, 4],
+    [5, 2, 6, 7],
+    [2, 0, 7, 5],   # centre
 ], dtype=np.int32)
 
 # All 6 local edges of a tetrahedron (node-pair indices)
@@ -233,7 +270,12 @@ def build_motor_mesh_3d(
                     in_stack=in_stack,
                 )
 
-                for local_tet in HEX_TO_TET_5:
+                # Checkerboard split parity → conforming tet mesh (see the
+                # note at HEX_TO_TET_5_MIRROR).  n_theta is always even
+                # (Qs × n_ang), so the parity is consistent around the ring.
+                template = (HEX_TO_TET_5 if ((ir + it + iz) & 1) == 0
+                            else HEX_TO_TET_5_MIRROR)
+                for local_tet in template:
                     tets_list.append(hex_n[local_tet])
                     tags_list.append(tag)
 
@@ -288,17 +330,34 @@ def _classify_3d(r, th, z, *, poles, R_shaft, R_mi, R_ro, R_si, R_so,
                   stack_length, rotor_angle=0.0, in_stack=True) -> int:
     """Classify a 3D element by its centroid (r, th, z)."""
 
-    # End-winding region (outside active stack)
+    def _slot_hit():
+        """(slot_index, layer) if (r, th) is inside a slot conductor region,
+        else None.  Shared by the in-stack and end-region branches so the
+        continued conductor has exactly the slot cross-section."""
+        if r < R_si * 0.999 or r > R_so * 0.999:
+            return None
+        sp   = 2 * np.pi / Qs
+        si   = int(th / sp) % Qs
+        dth  = th - (si + 0.5) * sp
+        re   = max(r, R_si + 1e-6)
+        a_op = np.arcsin(min(b_open / (2 * R_si), 0.9999))
+        a_sl = np.arcsin(min(b_slot / (2 * re), 0.9999))
+        in_op = (r < R_si + h_wedge + 1e-4) and (abs(dth) < a_op)
+        in_sl = (r >= R_si + h_wedge - 1e-4) and (abs(dth) < a_sl)
+        if (in_op or in_sl) and r < R_si + h_slot + 1e-4:
+            return si, (0 if r < R_si + h_slot / 2 else 1)
+        return None
+
+    # ── End region (outside active stack) ─────────────────────────────────
+    # Neither rotor nor stator iron extends axially.  Everything is air
+    # except the slot conductors, which are continued straight to the axial
+    # boundary so that the current source is divergence-free.  See the
+    # end-region modelling note at the top of this file.
     if not in_stack:
-        # Only stator copper overhangs exist outside the stack.
-        # Everything else (rotor, stator iron) doesn't extend axially.
-        if r > R_si:
-            return TAG_END_WINDING   # stator winding overhang region
-        if r < R_shaft * 1.01:
-            return _shaft_tag(poles)
-        if r < R_ro * 1.001:
-            return TAG_ROTOR_IRON    # rotor/shaft in end region (if we model it)
-        return TAG_STATOR_IRON       # end-winding support / air classified as stator
+        hit = _slot_hit()
+        if hit is not None:
+            return _end_coil_tag(hit[0], hit[1], Qs)
+        return TAG_END_WINDING          # air
 
     # ── Active stack region ───────────────────────────────────────────────
     if r < R_shaft * 1.01:
@@ -317,7 +376,7 @@ def _classify_3d(r, th, z, *, poles, R_shaft, R_mi, R_ro, R_si, R_so,
         pole_ang = th_r % pp
         if abs(pole_ang - np.pi / poles) < half_m:
             return _pm_tag(int(th_r / pp) % poles)
-        return TAG_ROTOR_IRON
+        return _rotor_air_tag(poles)    # inter-pole gap: air, not iron
 
     if r < R_si * 0.999:
         return _airgap_tag(poles)
@@ -325,19 +384,9 @@ def _classify_3d(r, th, z, *, poles, R_shaft, R_mi, R_ro, R_si, R_so,
     if r > R_so * 0.999:
         return TAG_STATOR_IRON
 
-    # Stator slot or tooth
-    sp      = 2 * np.pi / Qs
-    si      = int(th / sp) % Qs
-    dth     = th - (si + 0.5) * sp
-    re      = max(r, R_si + 1e-6)
-    a_op    = np.arcsin(min(b_open / (2 * R_si), 0.9999))
-    a_sl    = np.arcsin(min(b_slot / (2 * re), 0.9999))
-    in_op   = (r < R_si + h_wedge + 1e-4) and (abs(dth) < a_op)
-    in_sl   = (r >= R_si + h_wedge - 1e-4) and (abs(dth) < a_sl)
-    if (in_op or in_sl) and r < R_si + h_slot + 1e-4:
-        lyr = 0 if r < R_si + h_slot / 2 else 1
-        return _winding_tag(si, lyr, Qs)
-
+    hit = _slot_hit()
+    if hit is not None:
+        return _winding_tag(hit[0], hit[1], Qs)
     return TAG_STATOR_IRON
 
 
@@ -474,13 +523,29 @@ def _outer_boundary(nodes, edges, r_outer: float):
     Find nodes and edges on the outer cylindrical surface (r ≈ R_so).
     These get A_tangential = 0 Dirichlet BC.
     """
+    # Domain boundary = outer cylinder (r ≈ R_so) + both axial end faces.
+    # Without the z-face condition the natural BC applies there (n × H = 0),
+    # which models an infinitely-permeable plate pressed against each end of
+    # the machine and exaggerates end-region inductance.  A_t = 0 (B_n = 0,
+    # "flux-parallel") is the standard far-field truncation.
     r_nodes = np.sqrt(nodes[:, 0]**2 + nodes[:, 1]**2)
-    outer_node_mask = r_nodes > r_outer
+    z       = nodes[:, 2]
+    tol     = 1e-9
+    on_cyl  = r_nodes > r_outer
+    on_z0   = z < z.min() + tol
+    on_zL   = z > z.max() - tol
+    outer_node_mask = on_cyl | on_z0 | on_zL
     outer_nodes = np.where(outer_node_mask)[0].astype(np.int32)
 
-    # Edges where BOTH nodes are on the outer surface
-    on_outer = outer_node_mask
-    outer_edge_mask = on_outer[edges[:, 0]] & on_outer[edges[:, 1]]
+    # An edge lies ON the boundary only if both endpoints are on the SAME
+    # boundary piece.  "Both endpoints somewhere on the boundary" would also
+    # catch interior tet diagonals that run from a z-face node to a
+    # cylinder node (or, with one axial layer, from face to face); pinning
+    # those imposes spurious interior constraints.
+    a, b = edges[:, 0], edges[:, 1]
+    outer_edge_mask = ((on_cyl[a] & on_cyl[b]) |
+                       (on_z0[a]  & on_z0[b])  |
+                       (on_zL[a]  & on_zL[b]))
     outer_edges = np.where(outer_edge_mask)[0].astype(np.int32)
 
     return outer_nodes, outer_edges
@@ -528,14 +593,17 @@ def _build_coil_data_3d(motor, tags, tets, Qs, stack_length) -> list:
         return coil_data
 
     for slot_idx, layer, phase, direction in layout:
-        t    = _winding_tag(slot_idx % Qs, layer, Qs)
-        idx  = np.where(tags == t)[0]
+        t     = _winding_tag(slot_idx % Qs, layer, Qs)
+        t_ext = _end_coil_tag(slot_idx % Qs, layer, Qs)
+        idx     = np.where(tags == t)[0]                     # in-stack only
+        idx_ext = np.where((tags == t) | (tags == t_ext))[0] # + end continuation
         if len(idx) == 0:
             continue
         coil_data.append(dict(
             slot=slot_idx % Qs, layer=layer,
             phase=phase, direction=direction,
-            elem_idx=idx,
+            elem_idx=idx,          # flux linkage: active stack only
+            elem_idx_ext=idx_ext,  # current source: stack + axial continuation
         ))
     return coil_data
 
@@ -559,7 +627,8 @@ def mesh_report_3d(mesh: MotorMesh3D) -> str:
         (TAG_ROTOR_IRON,    "Rotor iron"),
         (_shaft_tag(poles), "Shaft"),
         (_airgap_tag(poles),"Air gap"),
-        (TAG_END_WINDING,   "End-winding"),
+        (_rotor_air_tag(poles), "Inter-pole air"),
+        (TAG_END_WINDING,   "End-region air"),
     ]:
         c = int((mesh.tags == tag).sum())
         if c:
@@ -567,9 +636,12 @@ def mesh_report_3d(mesh: MotorMesh3D) -> str:
     pm_cnt = int(sum((mesh.tags == _pm_tag(p)).sum() for p in range(poles)))
     if pm_cnt:
         lines.append(f"  {'PM bodies':<18}: {pm_cnt:6,} tets")
-    wc = int((mesh.tags >= 200).sum() & (mesh.tags < 500).sum())
+    wc = int(((mesh.tags >= 200) & (mesh.tags < 500)).sum())
     if wc:
         lines.append(f"  {'Winding slots':<18}: {wc:6,} tets")
+    ec = int((mesh.tags >= TAG_END_COIL).sum())
+    if ec:
+        lines.append(f"  {'End conductors':<18}: {ec:6,} tets")
     lines.append(f"  Airgap faces    : {len(mesh.airgap_faces):,} triangles")
     lines.append(f"  Outer BC edges  : {len(mesh.outer_edges):,}")
     return "\n".join(lines)

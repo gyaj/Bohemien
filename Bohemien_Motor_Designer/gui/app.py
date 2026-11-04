@@ -323,6 +323,11 @@ def main():
             nb.add(t11, text="  3D FEM  ")
             self._build_3dfem_tab(t11)
 
+            # Tab 12 — Flux Visualisation
+            t12 = tk.Frame(nb, bg=PANEL)
+            nb.add(t12, text="  Flux Viz  ")
+            self._build_flux_tab(t12)
+
             self._notebook = nb
 
         def _build_mfg_tab(self, parent):
@@ -941,10 +946,22 @@ def main():
                 h     = m.back_emf_harmonics(n_harmonics=15)
                 b_gap_note = (f"B_gap={cog['B_gap_used']:.3f}T magnet-circuit"
                               if cog.get("B_gap_used") else "")
+                try:
+                    brk = m.inductance_breakdown()
+                    brk_lines = [
+                        f"    L_ag {brk['L_ag']*1e3:.4f}  L_h {brk['L_h']*1e3:.4f}  "
+                        f"L_slot {brk['L_slot']*1e3:.4f}  L_tt {brk['L_tt']*1e3:.4f}  "
+                        f"L_ew {brk['L_ew']*1e3:.4f} mH",
+                        f"    L_2d (what 2D/3D FEM sees) {brk['L_2d']*1e3:.4f} mH   "
+                        f"L_ew fraction {brk['L_ew_fraction']*100:.1f} %",
+                    ]
+                except Exception:
+                    brk_lines = []
                 lines = [
                     "─── Analytical Results ───",
-                    f"  Ld (analytical)  : {m.Ld*1000:.3f} mH",
-                    f"  Lq (analytical)  : {m.Lq*1000:.3f} mH",
+                    f"  Ld (analytical)  : {m.Ld*1000:.4f} mH",
+                    f"  Lq (analytical)  : {m.Lq*1000:.4f} mH",
+                    *brk_lines,
                     f"  Cogging Tpp      : {cog['Tcog_pp_Nm']:.3f} N·m  "
                     f"({cog['Tcog_pp_pct']:.2f}% rated)  [{b_gap_note}]",
                     f"  Cogging period   : {cog['cogging_period_deg']:.2f}°  "
@@ -1051,6 +1068,7 @@ def main():
                 m = self._results["motor"]
                 runner = self._make_fea_runner(m)
                 data   = runner.run_loaded(progress_cb=self._fea_log)
+                self._results["fea_loaded"] = data    # for the 3D tab's 2D-vs-3D lines
                 self.after(0, lambda: self._fea_update_loaded(data))
             except Exception as e:
                 self._fea_log(f"ERROR: {e}")
@@ -1068,21 +1086,23 @@ def main():
               2. FEARunner (Elmer) -- used only if GMSH + Elmer are both on PATH
 
             The Python runner is preferred because it needs no installation.
-            The user can force Elmer by setting Bohemien_Motor_Designer_USE_ELMER=1 in
+            The user can force Elmer by setting MOTORDESIGN2_USE_ELMER=1 in
             the environment.
             """
             import os, shutil
-            use_elmer = os.environ.get("Bohemien_Motor_Designer_USE_ELMER", "0") == "1"
+            use_elmer = os.environ.get("MOTORDESIGN2_USE_ELMER", "0") == "1"
 
             if use_elmer:
                 from Bohemien_Motor_Designer.fea.runner import FEARunner
-                self._fea_log("Using Elmer FEA pipeline (Bohemien_Motor_Designer_USE_ELMER=1)", 0.0)
+                self._fea_log("Using Elmer FEA pipeline (MOTORDESIGN2_USE_ELMER=1)", 0.0)
                 return FEARunner(motor, work_dir=self._fea_workdir_var.get())
 
             # Default: py_runner (validated numpy/scipy FEM, no external tools)
             from Bohemien_Motor_Designer.fea.py_runner import PythonFEARunner as _PyRunner
             self._fea_log("Using built-in Python FEM solver (numpy/scipy only)", 0.0)
-            runner = _PyRunner(motor, n_radial_airgap=4, n_ang_per_slot=8)
+            # 8 airgap layers: the convergence study on the reference motor
+            # showed Ke 0.80× at 4 layers vs 1.00× at 8 (Ld +20 %).  Cost: ~7 s.
+            runner = _PyRunner(motor, n_radial_airgap=8, n_ang_per_slot=12)
             runner.build_mesh()
             self._fea_log("FEM mesh built — ready to solve.", 0.05)
             return runner
@@ -1132,11 +1152,27 @@ def main():
                 f"  T_avg (FEA)  : {data.get('torque_avg_Nm', float('nan')):.2f} N·m",
                 f"  T_rated      : {m.rated_torque:.2f} N·m",
             ]
+            if data.get("Ke_Wb"):
+                ke_an = m.back_emf_constant()
+                lines.append(f"  Ke (FEA)     : {data['Ke_Wb']:.5f} Wb   analyt {ke_an:.5f}  "
+                             f"(ratio {data['Ke_Wb']/(ke_an+1e-12):.3f})")
             if data.get("Ld_H"):
+                Ld = data['Ld_H']*1000; Lq = (data.get('Lq_H') or m.Lq)*1000
+                L_ew = data.get("L_ew_mH", 0.0)
                 lines += [
-                    f"  Ld (FEA)     : {data['Ld_H']*1000:.3f} mH",
-                    f"  Lq (FEA)     : {(data.get('Lq_H') or m.Lq)*1000:.3f} mH",
+                    "  — Inductance: 2D FEM has no end-winding term —",
+                    f"  Ld 2D raw    : {Ld:.4f} mH   analyt L_2d  {data.get('L_2d_anal_mH', 0):.4f} mH",
+                    f"  Lq 2D raw    : {Lq:.4f} mH",
+                    f"  + L_ew       : {L_ew:.4f} mH  (analytical, ±30–50 %)",
+                    f"  Ld total     : {data.get('Ld_total_mH', Ld+L_ew):.4f} mH   "
+                    f"analyt L_tot {data.get('L_total_anal_mH', m.Ld*1000):.4f} mH",
+                    f"  Lq total     : {data.get('Lq_total_mH', Lq+L_ew):.4f} mH",
                 ]
+                if "conv_ratio" in data:
+                    cr = data["conv_ratio"]
+                    flag = "ok" if data.get("conv_converged") else "NOT converged — raise AG layers"
+                    lines.append(f"  Mesh conv.   : {cr:.3f}  "
+                                 f"[{data.get('conv_mesh_fine','')} vs {data.get('conv_mesh_coarse','')}]  {flag}")
             if data.get("emf_waveform") and data["emf_waveform"].get("thd_pct") is not None:
                 lines.append(f"  EMF THD (FEA): {data['emf_waveform']['thd_pct']:.1f}%")
 
@@ -1573,15 +1609,20 @@ def main():
                            buttonbackground=PANEL, relief="flat"
                            ).grid(row=0, column=col+1, sticky="w", padx=(0, 10))
 
-            self._3d_nang  = tk.IntVar(value=4)
-            self._3d_nax   = tk.IntVar(value=6)
-            self._3d_nag   = tk.IntVar(value=3)
-            self._3d_new   = tk.IntVar(value=2)
+            # Defaults chosen from the convergence study on the reference
+            # motor: AG layers is the dominant knob (8 → Ke within 1 %);
+            # 2 axial layers are enough for a pure extrusion; End-region 0
+            # = pure extrusion (validated against 2D).  End-region > 0 is
+            # the experimental straight-conductor model — see runner3d.py.
+            self._3d_nang  = tk.IntVar(value=8)
+            self._3d_nax   = tk.IntVar(value=2)
+            self._3d_nag   = tk.IntVar(value=8)
+            self._3d_new   = tk.IntVar(value=0)
 
             _spin(ctrl, "Ang/slot:",  self._3d_nang, 4,  16, 2, 0)
-            _spin(ctrl, "Axial:",     self._3d_nax,  4,  16, 2, 2)
-            _spin(ctrl, "AG layers:", self._3d_nag,  2,   8, 1, 4)
-            _spin(ctrl, "End-wind:",  self._3d_new,  1,   4, 1, 6)
+            _spin(ctrl, "Axial:",     self._3d_nax,  1,  16, 1, 2)
+            _spin(ctrl, "AG layers:", self._3d_nag,  2,  16, 2, 4)
+            _spin(ctrl, "End-region:", self._3d_new, 0,   4, 1, 6)
 
             self._btn_3d = tk.Button(
                 ctrl, text="\u25b6 Run 3D FEM",
@@ -1719,42 +1760,487 @@ def main():
             theta_w = r.get("theta_w_deg", 0)
 
             ke_ratio = Ke_3d / Ke_an if Ke_an > 1e-9 else 0
+            L_ew     = r.get("L_ew_mH", 0)
+            Ld_tot   = r.get("Ld_total_mH", Ld_3d + L_ew)
+            Lq_tot   = r.get("Lq_total_mH", Lq_3d + L_ew)
+            L2d_an   = r.get("L_2d_anal_mH", 0)
+            Ltot_an  = r.get("L_total_anal_mH", Ld_an)
+            echk     = r.get("Ld_energy_check", float("nan"))
+            end_mdl  = r.get("end_region_model", "none (pure extrusion)")
+
+            # Pull the last 2D FEM result (if any) for a direct 2D-vs-3D line
+            r2d = (self._results or {}).get("fea_loaded") or {}
+            Ld_2d = r2d.get("Ld_mH"); Lq_2d = r2d.get("Lq_mH"); Ke_2d = r2d.get("Ke_Wb")
+
+            def _tag(x):
+                if x is None or not np.isfinite(x):
+                    return ""
+                return "\u2713" if 0.95 <= x <= 1.05 else ("~" if 0.85 <= x <= 1.15 else "\u26a0")
 
             lines = [
                 "\u2500\u2500\u2500 3D N\u00e9d\u00e9lec FEM Results \u2500\u2500\u2500",
                 f"  Mesh:    {nodes:,} nodes  {tets:,} tets  {edges:,} edge DOFs",
                 f"  Solve:   {dt:.0f}s total (mesh + 3 solves)",
+                f"  End region: {end_mdl}",
                 "",
-                "  — Flux Linkage (Ke) —",
+                "  \u2014 Flux Linkage (Ke) \u2014",
                 f"  Ke 3D      : {Ke_3d:.5f} Wb",
-                f"  Ke analyt  : {Ke_an:.5f} Wb",
-                f"  Ratio      : {ke_ratio:.3f}  "
-                f"({'↑ end-winding' if ke_ratio < 0.95 else 'converged'})",
+                f"  Ke analyt  : {Ke_an:.5f} Wb    ratio {ke_ratio:.3f} {_tag(ke_ratio)}",
+            ]
+            if Ke_2d:
+                lines.append(f"  Ke 2D FEM  : {Ke_2d:.5f} Wb    3D/2D {Ke_3d/Ke_2d:.3f} {_tag(Ke_3d/Ke_2d)}")
+            lines += [
                 f"  \u03b8_w offset : {theta_w:.1f}\u00b0 electrical",
                 "",
-                "  — Inductances (Park perturbation) —",
-                f"  Ld 3D      : {Ld_3d:.3f} mH    analyt: {Ld_an:.3f} mH",
-                f"  Lq 3D      : {Lq_3d:.3f} mH    analyt: {Lq_an:.3f} mH",
-                f"  Lq/Ld 3D   : {Lq_3d/(Ld_3d+1e-9):.3f}  "
-                f"(analyt: {Lq_an/(Ld_an+1e-9):.3f})",
+                "  \u2014 Inductances \u2014",
+                "  (3D extrusion sees the same leakage as 2D: slot, tooth-tip,",
+                "   harmonic.  End-winding L_ew is analytical, added to both.)",
+                f"  Ld 3D raw  : {Ld_3d:.4f} mH    analyt L_2d : {L2d_an:.4f} mH",
+                f"  Lq 3D raw  : {Lq_3d:.4f} mH",
+            ]
+            if Ld_2d:
+                lines.append(f"  Ld 2D raw  : {Ld_2d:.4f} mH    3D/2D {Ld_3d/Ld_2d:.3f} {_tag(Ld_3d/Ld_2d)}")
+            if Lq_2d:
+                lines.append(f"  Lq 2D raw  : {Lq_2d:.4f} mH    3D/2D {Lq_3d/Lq_2d:.3f} {_tag(Lq_3d/Lq_2d)}")
+            lines += [
+                f"  + L_ew     : {L_ew:.4f} mH   (Richter/Pyrh\u00f6nen, \u00b130\u201350 %)",
+                f"  Ld total   : {Ld_tot:.4f} mH    analyt L_tot: {Ltot_an:.4f} mH",
+                f"  Lq total   : {Lq_tot:.4f} mH",
+                f"  Lq/Ld 3D   : {Lq_3d/(Ld_3d+1e-9):.3f}",
+                f"  Energy chk : {echk:.4f}  (flux-linkage / stored-energy Ld, expect 1.000)",
                 "",
-                "  — Airgap B-field (mid-stack) —",
+                "  \u2014 Airgap B-field (mid-stack) \u2014",
                 f"  |B| mean   : {B_mean:.3f} T    analyt: {B_an:.3f} T",
                 f"  |B| max    : {B_max:.3f} T",
                 "",
-                "  Tip: increase Ang/slot for better Ke accuracy.",
-                "  End-winding effects reduce Ke vs 2D by 5-15%.",
+                "  Convergence: AG layers is the main knob (8 \u2192 Ke within ~1 %),",
+                "  then Ang/slot.  Axial layers barely matter for a pure extrusion.",
             ]
 
             self._set_text(self.txt_3d_results, "\n".join(lines))
             self._3dfem_status.config(
-                text=f"✔  3D FEM done  —  "
+                text=f"\u2714  3D FEM done  \u2014  "
                      f"Ke={Ke_3d:.4f}Wb (ratio {ke_ratio:.2f})  "
-                     f"Ld={Ld_3d:.2f}mH  Lq={Lq_3d:.2f}mH  "
+                     f"Ld={Ld_3d:.4f}+{L_ew:.4f}mH  Lq={Lq_3d:.4f}+{L_ew:.4f}mH  "
                      f"[{dt:.0f}s]")
 
 
 
+
+
+
+        # ── Flux Visualisation tab ───────────────────────────────────────────────
+
+        def _build_flux_tab(self, parent):
+            """
+            Tab 12 — Magnetic Flux Visualisation (Phase 1).
+
+            Shows three matplotlib panels:
+              Left  : A_z contours (= exact flux lines, no interpolation needed)
+              Centre: |B| magnitude colour map on the triangular mesh
+              Right : Material region map with flux density legend
+
+            All data comes from the existing 2D magnetostatic solver — no new
+            solver code is required. The FEM solve takes 0.3–2s depending on mesh.
+            """
+
+            # ── Controls strip ────────────────────────────────────────────────
+            ctrl = tk.Frame(parent, bg=PANEL)
+            ctrl.pack(fill="x", padx=10, pady=(8, 4))
+
+            def _lbl(text, col):
+                tk.Label(ctrl, text=text, bg=PANEL, fg=TEXT_DIM,
+                         font=FONT_BODY).grid(row=0, column=col,
+                                              sticky="w", padx=(0, 3))
+
+            def _spin(var, lo, hi, step, col, w=5):
+                tk.Spinbox(ctrl, from_=lo, to=hi, increment=step,
+                           textvariable=var, width=w,
+                           bg=ENTRY_BG, fg=TEXT, font=FONT_BODY,
+                           buttonbackground=PANEL, relief="flat",
+                           ).grid(row=0, column=col, sticky="w", padx=(0, 10))
+
+            # Angular mesh density
+            _lbl("Ang/slot:", 0)
+            self._fv_nang = tk.IntVar(value=8)
+            _spin(self._fv_nang, 4, 32, 4, 1)
+
+            # Airgap radial layers
+            _lbl("AG layers:", 2)
+            self._fv_nag = tk.IntVar(value=4)
+            _spin(self._fv_nag, 2, 12, 1, 3)
+
+            # Rotor angle (electrical degrees)
+            _lbl("Rotor angle (°):", 4)
+            self._fv_angle = tk.DoubleVar(value=0.0)
+            _spin(self._fv_angle, 0, 360, 15, 5, w=6)
+
+            # Flux line count
+            _lbl("Flux lines:", 6)
+            self._fv_nlines = tk.IntVar(value=20)
+            _spin(self._fv_nlines, 8, 60, 4, 7)
+
+            # Colourmap selector
+            _lbl("B colourmap:", 8)
+            self._fv_cmap = tk.StringVar(value="plasma")
+            cmaps = ["plasma", "hot", "inferno", "magma", "viridis",
+                     "RdBu_r", "coolwarm"]
+            ttk.Combobox(ctrl, textvariable=self._fv_cmap, values=cmaps,
+                         width=10, state="readonly",
+                         ).grid(row=0, column=9, sticky="w", padx=(0, 10))
+
+            # Run button
+            self._btn_fv = tk.Button(
+                ctrl, text="▶ Run Flux Viz",
+                bg=ACCENT, fg="#ffffff", font=FONT_BODY,
+                relief="flat", cursor="hand2",
+                command=self._flux_run_async)
+            self._btn_fv.grid(row=0, column=10, sticky="ew", padx=(4, 6))
+
+            # Save button
+            self._btn_fv_save = tk.Button(
+                ctrl, text="💾 Save PNG",
+                bg=PANEL, fg=TEXT, font=FONT_BODY,
+                relief="flat", cursor="hand2",
+                command=self._flux_save)
+            self._btn_fv_save.grid(row=0, column=11, sticky="ew")
+
+            # Animate button
+            self._fv_animate = tk.BooleanVar(value=False)
+            tk.Checkbutton(ctrl, text="Animate rotation",
+                           variable=self._fv_animate,
+                           bg=PANEL, fg=TEXT, selectcolor=PANEL,
+                           activebackground=PANEL, font=FONT_BODY,
+                           ).grid(row=0, column=12, sticky="w", padx=(8, 0))
+
+            # Status bar
+            self._fv_status = tk.Label(
+                parent,
+                text="Run a design first, then click Run Flux Viz.",
+                bg=PANEL, fg=TEXT_DIM, font=FONT_BODY, anchor="w")
+            self._fv_status.pack(fill="x", padx=10, pady=(0, 2))
+
+            # Progress bar
+            self._fv_progress = ttk.Progressbar(parent, mode="indeterminate",
+                                                  length=200)
+            self._fv_progress.pack(fill="x", padx=10, pady=(0, 4))
+
+            # ── Figure: 3 panels ──────────────────────────────────────────────
+            self._fv_fig = Figure(figsize=(15, 6), facecolor="#0f1117")
+            self._fv_canvas = FigureCanvasTkAgg(self._fv_fig, master=parent)
+            self._fv_canvas.get_tk_widget().pack(fill="both", expand=True,
+                                                  padx=6, pady=(0, 4))
+            toolbar = NavigationToolbar2Tk(self._fv_canvas, parent,
+                                           pack_toolbar=False)
+            toolbar.configure(bg=BG)
+            toolbar.pack(side="bottom", fill="x")
+            self._fv_canvas.draw()
+
+            # State cache
+            self._fv_mesh  = None
+            self._fv_motor = None
+            self._fv_Az    = None
+            self._fv_animating = False
+
+        def _flux_run_async(self):
+            """Start the flux visualisation solve in a background thread."""
+            if not self._results or "motor" not in self._results:
+                self._fv_status.config(
+                    text="⚠  Run a design first (▶ RUN DESIGN).")
+                return
+            if self._fv_animating:
+                self._fv_animating = False
+                self._btn_fv.config(text="▶ Run Flux Viz")
+                return
+            self._btn_fv.config(state="disabled")
+            self._fv_progress.start(12)
+            self._fv_status.config(text="Building mesh and solving…")
+            t = threading.Thread(target=self._flux_worker, daemon=True)
+            t.start()
+
+        def _flux_worker(self):
+            """Background: mesh → solve → plot → update canvas."""
+            try:
+                motor  = self._results["motor"]
+                n_ang  = self._fv_nang.get()
+                n_ag   = self._fv_nag.get()
+                angle_deg = self._fv_angle.get()
+                rotor_angle_rad = float(angle_deg) * np.pi / 180.0
+
+                self.after(0, lambda: self._fv_status.config(
+                    text=f"Building mesh  (ang/slot={n_ang}, AG layers={n_ag})…"))
+
+                from Bohemien_Motor_Designer.fea.py_mesh import build_motor_mesh
+                mesh = build_motor_mesh(motor,
+                                        n_radial_airgap=n_ag,
+                                        n_angular_per_slot=n_ang)
+
+                self.after(0, lambda: self._fv_status.config(
+                    text=f"Mesh: {mesh.n_nodes:,} nodes  {mesh.n_elems:,} elements"
+                         f"  —  Solving magnetostatics…"))
+
+                from Bohemien_Motor_Designer.fea.py_solver import (
+                    solve_magnetostatic, compute_B_field)
+
+                A_z = solve_magnetostatic(mesh, motor,
+                                          rotor_angle=rotor_angle_rad,
+                                          Id=0.0, Iq=0.0,
+                                          electrical_angle=0.0)
+                Bx, By, B_mag = compute_B_field(mesh, A_z)
+
+                # Cache for animation and export
+                self._fv_mesh  = mesh
+                self._fv_motor = motor
+                self._fv_Az    = A_z
+
+                self.after(0, lambda: self._fv_status.config(
+                    text="Rendering flux visualisation…"))
+                self.after(0, lambda: self._flux_render(
+                    mesh, A_z, Bx, By, B_mag, motor, angle_deg))
+
+            except Exception as exc:
+                import traceback as _tb
+                msg = f"{exc}\n{_tb.format_exc()}"
+                self.after(0, lambda m=msg: self._fv_status.config(
+                    text=f"⚠  {exc}"))
+                self.after(0, lambda m=msg: print(m))
+            finally:
+                self.after(0, self._fv_progress.stop)
+                self.after(0, lambda: self._btn_fv.config(state="normal"))
+
+        def _flux_render(self, mesh, A_z, Bx, By, B_mag, motor, angle_deg):
+            """
+            Render three panels into self._fv_fig.
+            Called on the main thread via self.after().
+
+            Panel 1 — Flux lines:   tricontour of A_z
+                       A_z isolines ARE the flux lines in 2D magnetostatics
+                       (Bx = dAz/dy, By = -dAz/dx, so B is tangent to A_z isolines)
+                       No interpolation needed — direct from nodal values.
+
+            Panel 2 — |B| map:      tripcolor of B_mag with material boundaries
+
+            Panel 3 — B histogram + material legend
+            """
+            import matplotlib.pyplot as _plt
+            from matplotlib.colors import Normalize
+            from matplotlib.cm import ScalarMappable
+            import matplotlib.patches as mpatches
+            import matplotlib.tri as mtri
+
+            FIG_BG  = "#0f1117"
+            AX_BG   = "#0d1020"
+            GRID_C  = "#1e2240"
+            self._fv_fig.clf()
+
+            gs = self._fv_fig.add_gridspec(
+                1, 3, wspace=0.08,
+                left=0.04, right=0.98, top=0.93, bottom=0.08)
+
+            ax1 = self._fv_fig.add_subplot(gs[0])
+            ax2 = self._fv_fig.add_subplot(gs[1])
+            ax3 = self._fv_fig.add_subplot(gs[2])
+
+            for ax in (ax1, ax2, ax3):
+                ax.set_facecolor(AX_BG)
+                ax.tick_params(colors="#6070a0", labelsize=7)
+                for spine in ax.spines.values():
+                    spine.set_edgecolor(GRID_C)
+
+            nodes   = mesh.nodes
+            elems   = mesh.elems
+            tags    = mesh.tags
+            x_mm    = nodes[:, 0] * 1000   # metres → mm
+            y_mm    = nodes[:, 1] * 1000
+            n_lines = self._fv_nlines.get()
+            cmap    = self._fv_cmap.get()
+
+            # ── Triangulation (shared across panels) ─────────────────────────
+            triang  = mtri.Triangulation(x_mm, y_mm, elems)
+
+            # Centroid coords for element-based data
+            cx_mm   = x_mm[elems].mean(axis=1)
+            cy_mm   = y_mm[elems].mean(axis=1)
+
+            # ─────────────────────────────────────────────────────────────────
+            # Panel 1 — Flux lines (A_z contours)
+            # ─────────────────────────────────────────────────────────────────
+            ax1.set_title("Magnetic flux lines  (isolines of A_z)",
+                           color="#c0c8e8", fontsize=8, pad=6)
+
+            # Filled contours first for background colour gradient
+            ax1.tricontourf(triang, A_z, levels=60, cmap="RdBu_r", alpha=0.55)
+
+            # Flux lines — solid black contour lines of A_z
+            cs = ax1.tricontour(triang, A_z, levels=n_lines,
+                                colors="white", linewidths=0.5, alpha=0.85)
+
+            # Material boundaries — draw element edges coloured by region
+            REGION_COLORS = {
+                "stator_iron": "#4488cc",
+                "rotor_iron":  "#44aacc",
+                "magnet":      "#e87040",
+                "winding_A":   "#e84080",
+                "winding_B":   "#80e840",
+                "winding_C":   "#4080e8",
+                "airgap":      "#223355",
+            }
+            _drawn_regions = set()
+            if hasattr(mesh, "groups") and mesh.groups:
+                for region, elem_idx in mesh.groups.items():
+                    col = REGION_COLORS.get(
+                        region.split("_")[0] if "_" in region else region,
+                        "#556688")
+                    if len(elem_idx) == 0:
+                        continue
+                    # Draw a thin boundary triangle patch per element
+                    tri_r = mtri.Triangulation(x_mm, y_mm, elems[elem_idx])
+                    ax1.triplot(tri_r, color=col, linewidth=0.15, alpha=0.35)
+
+            ax1.set_xlabel("x  [mm]", color="#6070a0", fontsize=7)
+            ax1.set_ylabel("y  [mm]", color="#6070a0", fontsize=7)
+            ax1.set_aspect("equal")
+            ax1.grid(True, color=GRID_C, linewidth=0.3, alpha=0.5)
+
+            # ─────────────────────────────────────────────────────────────────
+            # Panel 2 — |B| magnitude map
+            # ─────────────────────────────────────────────────────────────────
+            ax2.set_title("|B| flux density map  [T]",
+                           color="#c0c8e8", fontsize=8, pad=6)
+
+            # B_mag is per element — use tripcolor
+            B_clip = np.clip(B_mag, 0, np.percentile(B_mag, 99))
+            tc = ax2.tripcolor(triang, B_clip, cmap=cmap, shading="gouraud",
+                               vmin=0, vmax=B_clip.max())
+
+            # Overlay A_z flux lines (fewer, thinner, semi-transparent)
+            ax2.tricontour(triang, A_z, levels=n_lines,
+                           colors="white", linewidths=0.4, alpha=0.55)
+
+            # Motor geometry outlines
+            motor_R_so = motor.stator.outer_radius * 1000
+            motor_R_si = motor.stator.inner_radius * 1000
+            motor_R_ro = motor.rotor_outer_radius  * 1000
+
+            for R, lw, ls in [(motor_R_so, 1.2, "-"),
+                               (motor_R_si, 0.8, "--"),
+                               (motor_R_ro, 0.8, "-.")]:
+                theta_ring = np.linspace(0, 2 * np.pi, 360)
+                ax2.plot(R * np.cos(theta_ring), R * np.sin(theta_ring),
+                         color="#88aadd", linewidth=lw, linestyle=ls,
+                         alpha=0.55)
+
+            # Colourbar
+            cb = self._fv_fig.colorbar(tc, ax=ax2, fraction=0.04, pad=0.02)
+            cb.ax.tick_params(colors="#6070a0", labelsize=7)
+            cb.set_label("Tesla", color="#6070a0", fontsize=7)
+
+            ax2.set_xlabel("x  [mm]", color="#6070a0", fontsize=7)
+            ax2.set_ylabel("y  [mm]", color="#6070a0", fontsize=7)
+            ax2.set_aspect("equal")
+
+            # ─────────────────────────────────────────────────────────────────
+            # Panel 3 — B magnitude histogram + region stats
+            # ─────────────────────────────────────────────────────────────────
+            ax3.set_title("B field distribution by region",
+                           color="#c0c8e8", fontsize=8, pad=6)
+
+            # Identify airgap elements by their tag
+            REGION_LABEL = {}
+            TAG_COLORS   = {}
+            if hasattr(mesh, "groups") and mesh.groups:
+                for name, eidx in mesh.groups.items():
+                    base = name.split("_")[0] if "_" in name else name
+                    col  = REGION_COLORS.get(base, "#556688")
+                    if len(eidx) > 0:
+                        B_r = B_mag[eidx]
+                        label = f"{name}  μ={B_r.mean():.3f}T"
+                        ax3.hist(B_r, bins=40, alpha=0.55, color=col,
+                                 label=label, density=True, histtype="stepfilled",
+                                 linewidth=0.6, edgecolor=col)
+            else:
+                # Fallback: whole-motor histogram
+                ax3.hist(B_mag, bins=60, alpha=0.7, color="#4f8ef7",
+                         density=True, histtype="stepfilled",
+                         edgecolor="#4f8ef7", linewidth=0.6,
+                         label=f"All elements  μ={B_mag.mean():.3f}T  "
+                               f"max={B_mag.max():.3f}T")
+
+            # Key reference lines
+            B_sat = 1.8   # typical silicon steel saturation
+            ax3.axvline(B_sat, color="#f7804f", linewidth=0.8,
+                        linestyle="--", alpha=0.8, label=f"Saturation ≈{B_sat}T")
+            ax3.axvline(B_mag.mean(), color="#4fcf82", linewidth=0.8,
+                        linestyle=":", label=f"Mean = {B_mag.mean():.3f}T")
+
+            ax3.set_xlabel("|B|  [T]", color="#6070a0", fontsize=7)
+            ax3.set_ylabel("Probability density", color="#6070a0", fontsize=7)
+            ax3.grid(True, color=GRID_C, linewidth=0.3, alpha=0.5)
+            ax3.legend(fontsize=6, loc="upper right",
+                       facecolor="#1a1d2e", edgecolor=GRID_C,
+                       labelcolor="#c0c8e8")
+
+            # ── Figure title ──────────────────────────────────────────────────
+            self._fv_fig.suptitle(
+                f"Magnetic Flux  —  {motor.poles}p/{motor.slots}s PMSM  "
+                f"|  Rotor angle = {angle_deg:.0f}°  "
+                f"|  B mean = {B_mag.mean():.3f} T   max = {B_mag.max():.3f} T",
+                color="#e8eaf6", fontsize=9)
+
+            self._fv_canvas.draw()
+
+            n_sat = int(np.sum(B_mag > B_sat))
+            pct_sat = 100.0 * n_sat / max(len(B_mag), 1)
+            self._fv_status.config(
+                text=f"✔  {mesh.n_nodes:,} nodes  |  B mean={B_mag.mean():.3f}T  "
+                     f"max={B_mag.max():.3f}T  |  "
+                     f"Saturated elements (>{B_sat}T): {n_sat} ({pct_sat:.1f}%)")
+
+            # Start animation if requested
+            if self._fv_animate.get():
+                self._fv_animating = True
+                self._btn_fv.config(text="■ Stop animation", state="normal")
+                self.after(50, self._flux_animate_step)
+
+        def _flux_animate_step(self):
+            """
+            Rotate the rotor by one step and re-solve.
+            Called repeatedly via self.after() until animation is stopped.
+            """
+            if not self._fv_animating or self._fv_motor is None:
+                self._fv_animating = False
+                self._btn_fv.config(text="▶ Run Flux Viz")
+                return
+
+            # Advance rotor angle by one step
+            current = self._fv_angle.get()
+            step    = 360.0 / (self._fv_motor.poles * 6)  # 1/6 electrical period
+            new_ang = (current + step) % 360.0
+            self._fv_angle.set(round(new_ang, 1))
+
+            # Solve in background thread
+            t = threading.Thread(target=self._flux_worker, daemon=True)
+            t.start()
+
+        def _flux_save(self):
+            """Save the current flux visualisation as PNG."""
+            if self._fv_motor is None:
+                self._fv_status.config(text="⚠  Run flux visualisation first.")
+                return
+            from tkinter.filedialog import asksaveasfilename
+            path = asksaveasfilename(
+                defaultextension=".png",
+                filetypes=[("PNG image", "*.png"),
+                           ("SVG vector", "*.svg"),
+                           ("PDF", "*.pdf"),
+                           ("All files", "*.*")],
+                initialfile="flux_visualisation.png",
+                title="Save flux visualisation")
+            if path:
+                self._fv_fig.savefig(path, dpi=250,
+                                     bbox_inches="tight",
+                                     facecolor="#0f1117")
+                self._fv_status.config(text=f"✔  Saved → {path}")
 
 
     # ── Run ──────────────────────────────────────────────────────────────────

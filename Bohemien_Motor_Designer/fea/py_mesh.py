@@ -27,6 +27,12 @@ _TAG_WINDING     = 200
 def _pm_tag(pole):       return _TAG_PM_BASE + pole
 def _airgap_tag(poles):  return 3 + poles + 1
 def _shaft_tag(poles):   return 3 + poles
+def _rotor_air_tag(poles): return 3 + poles + 2
+# Rotor air = the inter-pole gaps between surface magnets (R_mi < r < R_ro,
+# outside the magnet arc).  Physically air / non-magnetic filler.  It must NOT
+# be tagged as rotor iron: iron there creates q-axis salient poles (an inset-
+# magnet rotor), giving Lq >> Ld on a machine that should have Lq ≈ Ld.
+# Kept distinct from _airgap_tag so the Arkkio torque ring is unaffected.
 def _winding_tag(s, lyr, Qs): return _TAG_WINDING + (s % Qs) * 2 + lyr
 
 
@@ -86,12 +92,15 @@ class MotorMesh:
             in_mag_th = np.abs(pole_ang - np.pi/poles) < half_mag
             pm        = in_mag_r & in_mag_th
             pole_idx  = (th_rotor / pp).astype(int) % poles
+            # Inter-pole gap in the magnet band is air, not iron
+            new_tags[in_mag_r & ~in_mag_th] = _rotor_air_tag(poles)
             new_tags[pm] = _TAG_PM_BASE + pole_idx[pm]
 
         self.tags[idx] = new_tags
         for p in range(poles):
             self.groups[_pm_tag(p)] = np.where(self.tags == _pm_tag(p))[0]
         self.groups[_TAG_ROTOR_IRON] = np.where(self.tags == _TAG_ROTOR_IRON)[0]
+        self.groups[_rotor_air_tag(poles)] = np.where(self.tags == _rotor_air_tag(poles))[0]
 
 
 # ── Builder ────────────────────────────────────────────────────────────────────
@@ -196,7 +205,7 @@ def _classify(r, th, *, poles, R_shaft, R_mi, R_ro, R_si, R_so,
         pp     = 2*np.pi/poles
         if abs(th_r % pp - np.pi/poles) < np.pi*alpha_p/poles:
             return _TAG_PM_BASE + int(th_r/pp) % poles
-        return _TAG_ROTOR_IRON
+        return _rotor_air_tag(poles)       # inter-pole gap: air, not iron
 
     if r < R_si*0.999:
         return _airgap_tag(poles)
@@ -286,7 +295,8 @@ def mesh_report(mesh: MotorMesh) -> str:
     poles = mesh._mesh_meta.get("poles", 0)
     lines = [f"Motor mesh: {mesh.n_nodes} nodes  {mesh.n_elems} elements"]
     for tag, name in [(1,"Stator iron"),(2,"Rotor iron"),
-                      (_shaft_tag(poles),"Shaft"),(_airgap_tag(poles),"Air gap")]:
+                      (_shaft_tag(poles),"Shaft"),(_airgap_tag(poles),"Air gap"),
+                      (_rotor_air_tag(poles),"Inter-pole air")]:
         c = int((mesh.tags == tag).sum())
         if c: lines.append(f"  {name:<18}: {c:5d} elems")
     pm_cnt = int(sum((mesh.tags == _pm_tag(p)).sum() for p in range(poles)))

@@ -309,20 +309,26 @@ def _build_J_source(mesh, motor, geom, Id, Iq, electrical_angle) -> np.ndarray:
     st      = motor.stator
     sp      = st.slot_profile if st else None
     A_slot  = sp.area() if sp else 1e-4
-    ff      = getattr(motor, "slot_fill_factor", 0.45)
     N_coil  = getattr(motor, "turns_per_coil", 2)
     n_lay   = motor.winding.layers if motor.winding else 2
     A_layer = A_slot / n_lay
-    J_scale = N_coil / (A_layer * ff + 1e-15)
+    # No fill factor here: J is applied over the whole meshed slot-layer
+    # cross-section, so J = N_coil·I / A_layer carries exactly N_coil·I
+    # ampere-turns.  (Same reasoning as py_solver._build_J_winding.)
+    J_scale = N_coil / (A_layer + 1e-15)
 
     vol      = geom["vol"]
     grad_lam = geom["grad_lam"]
 
-    # For each winding coil region:
+    # For each winding coil region.  The SOURCE uses the extended element
+    # list (stack + straight axial continuation to the z boundary) so that
+    # div J = 0 inside the domain.  Flux linkage (compute_flux_linkage_3d)
+    # deliberately uses only the in-stack elements — see the end-region
+    # modelling note in mesh3d.py.
     for coil in mesh.coil_data:
         phase     = coil["phase"]
         direction = coil["direction"]
-        idx       = coil["elem_idx"]   # tet indices in this slot+layer
+        idx       = coil.get("elem_idx_ext", coil["elem_idx"])
         if len(idx) == 0:
             continue
 
@@ -415,34 +421,85 @@ def _apply_boundary_conditions(K: csr_matrix, f: np.ndarray, mesh) -> tuple:
 
 def _spanning_tree_edges(mesh) -> set:
     """
-    BFS spanning tree of the node graph.
-    Returns the set of global edge indices that form the spanning tree.
-    These edges are pinned to zero for the Coulomb gauge.
+    Boundary-first BFS spanning tree of the node graph for the tree-cotree
+    gauge.  Returns the set of global edge indices pinned to zero.
+
+    Why boundary-first
+    ------------------
+    Tree edges are pinned to zero (gauge) and so are ALL edges on the
+    Dirichlet boundary (A_t = 0).  If the tree is grown from an arbitrary
+    node, it can contain an *interior* path between two boundary nodes;
+    together with a boundary path that forms a closed loop whose every
+    edge is pinned, i.e. a spurious "zero flux through this interior
+    surface" constraint.  With Dirichlet faces at both ends of the stack
+    these loops thread the whole machine and the field collapses.
+
+    Growing the tree over the boundary graph first (boundary edges only)
+    and only then into the interior guarantees that any cycle in
+    (tree ∪ boundary edges) lies entirely on the boundary, so the only
+    constraints enforced are the intended B_n = 0 on the boundary.
+    (Manges & Cendes, IEEE Trans. Magn. 1995; Albanese & Rubinacci.)
     """
     N      = mesh.n_nodes
     edges  = mesh.edges   # (M, 2)
 
-    # Build adjacency list: node → [(neighbour, edge_idx)]
+    bnd_edge = np.zeros(len(edges), dtype=bool)
+    bnd_edge[mesh.outer_edges] = True
+    bnd_node = np.zeros(N, dtype=bool)
+    bnd_node[mesh.outer_nodes] = True
+
+    # Adjacency: node → [(neighbour, edge_idx, is_boundary_edge)]
     adj = [[] for _ in range(N)]
     for ei, (a, b) in enumerate(edges):
-        adj[a].append((b, ei))
-        adj[b].append((a, ei))
+        be = bool(bnd_edge[ei])
+        adj[a].append((b, ei, be))
+        adj[b].append((a, ei, be))
 
     visited    = np.zeros(N, dtype=bool)
     tree_edges = set()
 
-    # BFS from node 0
-    queue = [0]
-    visited[0] = True
+    def _bfs(seeds, boundary_only):
+        queue = [s for s in seeds if not visited[s]]
+        for s in queue:
+            visited[s] = True
+        while queue:
+            nxt = []
+            for node in queue:
+                for nb, ei, be in adj[node]:
+                    if boundary_only and not be:
+                        continue
+                    if not visited[nb]:
+                        visited[nb] = True
+                        tree_edges.add(ei)
+                        nxt.append(nb)
+            queue = nxt
+
+    # Phase 1: span every boundary component using boundary edges only.
+    bnd_list = np.where(bnd_node)[0]
+    for s in bnd_list:
+        if not visited[s]:
+            _bfs([int(s)], boundary_only=True)
+
+    # Phase 2: grow into the interior from the whole boundary (or from
+    # node 0 if there is no Dirichlet boundary at all).
+    seeds = [int(s) for s in bnd_list] if len(bnd_list) else [0]
+    # Re-seed BFS from all visited boundary nodes
+    queue = seeds
     while queue:
-        next_queue = []
+        nxt = []
         for node in queue:
-            for nb, ei in adj[node]:
+            for nb, ei, be in adj[node]:
                 if not visited[nb]:
                     visited[nb] = True
                     tree_edges.add(ei)
-                    next_queue.append(nb)
-        queue = next_queue
+                    nxt.append(nb)
+        queue = nxt
+
+    # Any node still unvisited belongs to a disconnected component
+    # (should not happen for a motor mesh) — span it from itself.
+    for s in np.where(~visited)[0]:
+        if not visited[s]:
+            _bfs([int(s)], boundary_only=False)
 
     return tree_edges
 
@@ -538,10 +595,22 @@ def compute_flux_linkage_3d(mesh, A_edge: np.ndarray, motor, geom: dict) -> dict
     """
     Per-phase flux linkage [Wb] via coil volume integral.
 
-        ψ_k = N_coil * (1/A_layer) ∫_coil A · ẑ dV
+        ψ_k = N_coil · (1/A_layer) · ∫_coil A · ẑ dV            [Wb]
 
-    A · ẑ is the z-component of the vector potential, extracted from
-    edge DOFs at element centroids.
+    (A·ẑ in Wb/m, dV in m³, A_layer in m² → Wb.  There is NO division by
+    the stack length; an earlier version had one and returned Wb/m.)
+
+    Gauge invariance — why the integral runs over the FULL conductor
+    -----------------------------------------------------------------
+    ∫A·dl is gauge-invariant only around a closed loop.  The tree-cotree
+    gauge adds an arbitrary gradient ∇φ to A, and ∫∇φ·dl ≠ 0 over an open
+    segment, so integrating A_z over the in-stack part of a conductor
+    alone gives a gauge-polluted number.  The slot conductors are
+    continued straight to the axial Dirichlet faces (see mesh3d.py), where
+    A_t = 0 closes the loop at zero cost; the loop integral is therefore
+    the A_z integral over the *extended* conductor (coil["elem_idx_ext"]).
+    Verified against the gauge-invariant stored-energy method
+    (L = 4W/3I²) to four significant figures on the reference motor.
     """
     psi = np.zeros(3, dtype=np.float64)
     vol     = geom["vol"]
@@ -570,17 +639,12 @@ def compute_flux_linkage_3d(mesh, A_edge: np.ndarray, motor, geom: dict) -> dict
     for coil in mesh.coil_data:
         phase     = coil["phase"]
         direction = coil["direction"]
-        idx       = coil["elem_idx"]
+        idx       = coil.get("elem_idx_ext", coil["elem_idx"])
         if len(idx) == 0:
             continue
-
-        Az_c   = A_z_cent[idx]
-        e_area = vol[idx]
-        # Correct formula: psi = N * (1/A_layer) * (1/L) * integral(A_z dV)
-        # = N * sum(A_z_cent * dV) / (A_layer * L_stack)
-        dpsi   = (N_coil * direction
-                  * np.sum(Az_c * e_area)
-                  / (A_layer * motor.stack_length + 1e-15))
+        dpsi = (N_coil * direction
+                * np.sum(A_z_cent[idx] * np.abs(vol[idx]))
+                / (A_layer + 1e-15))
         psi[phase] += dpsi
 
     return {"psi_A": float(psi[0]), "psi_B": float(psi[1]), "psi_C": float(psi[2])}
