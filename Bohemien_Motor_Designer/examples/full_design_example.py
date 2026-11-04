@@ -135,14 +135,18 @@ def main():
         sleeve_material      = "carbon_fibre",
     )
 
-    # Winding: 8p/48s, double-layer, 11 turns/coil, 1 parallel path
-    # → 88 series turns/phase → Ke = 0.109 V·s/rad → back-EMF 183V @ 4000rpm
+    # Winding: 8p/48s, double-layer, 1 turn/coil, 1 parallel path.
+    # Double-layer 48 slots = 48 coils, 16 per phase → N_series = 16 × 1 = 16
+    # → Ke = 0.113 V·s/rad → peak back-EMF 190 V @ 4000 rpm (400 V bus).
+    # (Before Nov-2026 the turns formula halved N_series for double-layer
+    #  windings, so this example carried 11 turns/coil and reported 88; the
+    #  physical winding it described had 176 turns and 2 kV back-EMF.)
     winding = WindingLayout(
         poles          = 8,
         slots          = 48,
         phases         = 3,
         layers         = 2,
-        turns_per_coil = 11,
+        turns_per_coil = 1,
         parallel_paths = 1,
     )
 
@@ -160,7 +164,7 @@ def main():
         magnet_material    = "N42SH",
         magnet_thickness   = 0.006,
         magnet_width_fraction = 0.83,
-        turns_per_coil     = 11,
+        turns_per_coil     = 1,
         conductor_diameter = 0.0009,   # 0.9mm wire, ~77A rated
         slot_fill_factor   = 0.48,
         parallel_paths     = 1,

@@ -222,15 +222,30 @@ class WindingLayout:
         return abs(kd)
 
     @property
+    def coils_per_phase(self) -> int:
+        """Number of coils per phase.
+
+        A coil has two sides.  Each slot holds `layers` coil sides, so the
+        machine has  slots × layers / 2  coils in total, of which 1/phases
+        belong to each phase:
+            single-layer (layers=1): slots / (2·phases)      e.g. 48s → 8
+            double-layer (layers=2): slots / phases          e.g. 48s → 16
+        """
+        return (self.slots * self.layers) // (2 * self.phases)
+
+    @property
     def total_series_turns_per_phase(self) -> int:
         """Total series turns per phase [turns].
-        Each slot has one going coil side per phase. Coils are series/parallel_paths.
-        For 2-layer: each slot contributes 1 coil side (going), return is in another slot.
+
+            N_series = coils_per_phase × turns_per_coil / parallel_paths
+
+        This must match the number of conductor passes the FEM sums over:
+        the layout table lists 2·coils_per_phase coil sides per phase, each
+        carrying turns_per_coil conductors.  (An earlier version divided by
+        an extra factor of 2 for double-layer windings — the FEM was right
+        and the analytical Ke was low by 2×, Ld/Lq by 4×.)
         """
-        # Number of coils per phase = slots / phases  (one coil-side per slot per layer,
-        # but each coil occupies 2 slots so coils_per_phase = slots/phases/layers * layers = slots/phases)
-        coils_per_phase = self.slots // self.phases
-        return (coils_per_phase * self.turns_per_coil) // (self.parallel_paths * 2)
+        return (self.coils_per_phase * self.turns_per_coil) // self.parallel_paths
 
     # ── Diagnostics ──────────────────────────────────────────────────────
 
