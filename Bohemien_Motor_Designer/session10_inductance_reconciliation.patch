@@ -1,0 +1,2475 @@
+diff --git a/Bohemien_Motor_Designer/DEVELOPMENT_LOG.md b/Bohemien_Motor_Designer/DEVELOPMENT_LOG.md
+new file mode 100644
+index 0000000..e59451a
+--- /dev/null
++++ b/Bohemien_Motor_Designer/DEVELOPMENT_LOG.md
+@@ -0,0 +1,404 @@
++# Bohemien Motor Designer — Development Log
++
++> **How to use this file**
++> Paste the entire contents of this file as your **first message** when starting
++> a new Claude chat. Claude will read it and have full context to continue
++> development immediately. Update this file after each session by asking:
++> *"Update DEVELOPMENT_LOG.md with what we did today."*
++
++---
++
++## Project identity
++
++| Item | Value |
++|---|---|
++| Repository | github.com/gyaj/Bohemien |
++| Package folder | `Bohemien_Motor_Designer/` |
++| Python package name (internal imports) | `Bohemien_Motor_Designer` |
++| Original name (all internal code was renamed from this) | `Bohemien_Motor_Designer` |
++| License | MIT |
++| CLA | In place via GitHub Actions (`license/cla` status check) |
++| Python version target | 3.11 (user's machine: Python 3.11.8 on Windows 10) |
++| GUI framework | tkinter + matplotlib TkAgg backend |
++| Key dependencies | numpy, scipy, matplotlib, anthropic (for agent) |
++| Exe build | PyInstaller 6.x, `build_exe.bat` → `dist/Bohemien_Motor_Designer.exe` |
++
++---
++
++## Reference motor (used for all validation)
++
++| Parameter | Value |
++|---|---|
++| Topology | 8-pole / 48-slot SPMSM |
++| Rated power | 30 kW |
++| Rated speed | 4000 rpm |
++| DC bus voltage | 400 V |
++| Stator OD | 225 mm |
++| Stator bore | 164 mm |
++| Airgap | 1 mm |
++| Stack length | 130 mm |
++| Magnet thickness | 6 mm |
++| Magnet width fraction α_p | 0.83 |
++| Magnet grade | N42SH (Br = 1.22 T, μ_r = 1.05) |
++| Turns per coil | **1** (was listed as 2 under the pre-Nov-2026 turns bug) |
++| N_series per phase | 16 (= coils_per_phase 16 × 1) |
++| Ke analytical | 0.1133 Wb (FEM 2D 0.1134, FEM 3D 0.1139) |
++| Rated torque | 71.6 Nm |
++| Efficiency | 94.7% (after turns fix; was 96.67% with half the real copper) |
++| Ld / Lq (analytical total) | 0.0911 mH (L_2d 0.0833 + L_ew 0.0078) |
++| Ld / Lq (2D FEM raw) | 0.0852 / 0.0784 mH |
++| Ld / Lq (3D FEM raw) | 0.0857 / 0.0790 mH |
++
++---
++
++## Package structure (63 Python files)
++
++```
++Bohemien_Motor_Designer/
++  __init__.py                    version = "2.1.0", lazy (no eager imports)
++  run_gui.py                     entry point for script and PyInstaller exe
++  Bohemien_Motor_Designer.spec   PyInstaller build recipe
++  build_exe.bat                  Windows double-click build script (cd .. then pyinstaller)
++  setup.py
++
++  core/
++    motor.py                     Motor base dataclass
++    pmsm.py                      PMSM: Ke, dq-model, MTPA, field weakening, analytical Ld/Lq
++    geometry/
++      stator.py                  StatorGeometry dataclass
++      slot_profiles.py           ParallelToothSlot, TrapezoidalSlot, OpenSlot, RoundBottomSlot
++      winding.py                 WindingLayout, winding_factor(), coil_sides_for_phase()
++      rotor.py
++    induction.py
++    synrel.py
++    manufacturing_report.py      12-section manufacturing specification generator
++    specs.py
++
++  analysis/
++    losses.py                    LossCalculator: Bertotti iron loss, Dowell copper loss
++    performance.py
++
++  fea/
++    py_mesh.py                   2D structured polar mesh — build_motor_mesh()
++    py_solver.py                 2D magnetostatic FEM — solve_magnetostatic(), compute_B_field()
++    py_torque.py                 Arkkio torque, compute_flux_linkage()
++    py_runner.py                 2D FEM runner — Ke, Ld, Lq, cogging sweep
++    mesh3d.py                    3D tetrahedral mesh — Freudenthal hex→5-tet split, edge table
++    solver3d.py                  3D Nédélec edge-element FEM — curl-curl, tree-cotree gauge
++    runner3d.py                  FEMRunner3D — pure-extrusion 3D check of 2D (+ analytical L_ew); energy cross-check
++    mesh_viz.py                  plot_mesh_overview() — 3-panel mesh visualisation
++    [legacy files]               fem_mesh.py, fem_solver.py, gmsh_exporter.py, runner.py etc.
++
++  gui/
++    __init__.py                  lazy — no module-level imports
++    app.py                       MotorDesignApp (tk.Tk) — 12 tabs, 2252 lines
++
++  io/
++    dxf_export.py                AutoCAD R12 ASCII DXF — export_dxf()
++    json_spec.py
++
++  thermal/
++    lumped_model.py              ThermalNetwork class (NOT LumpedThermalModel)
++    cooling.py                   WaterJacketCooling, AirCooling, OilSprayCooling
++
++  materials/
++    library.py                   MaterialLibrary, LaminationMaterial, MagnetMaterial
++
++  scaling/
++    similarity.py
++
++  utils/
++    validation.py                DesignRuleChecker — check_all() → list[CheckResult]
++
++  tests/
++    test_inductance_reconciliation.py   7 tests, 17 s: analytical ↔ 2D ↔ 3D (run: python -m pytest Bohemien_Motor_Designer/tests)
++
++  drive/
++    field_weakening.py
++    inverter.py
++```
++
++---
++
++## GUI tabs
++
++| Tab | Name | Key widget |
++|---|---|---|
++| 1 | Summary | scrolledtext |
++| 2 | Losses | scrolledtext |
++| 3 | Thermal | scrolledtext |
++| 4 | DRC | scrolledtext |
++| 5 | Efficiency Map | matplotlib figure |
++| 6 | Scaling | scrolledtext |
++| 7 | Mfg Report | scrolledtext + Save button |
++| 8 | FEA | 2D FEM controls + figure |
++| 9 | Mesh Viz | 3-panel mesh figure |
++| 10 | DXF Export | DXF preview + export button |
++| 11 | 3D FEM | 3D FEM controls + results text |
++| 12 | Flux Viz | **NEW** — 3-panel flux visualisation |
++
++---
++
++## Complete bug fix history
++
++### Session 1–3 (2026-03-01) — Original motordesign package
++| # | File | Bug | Fix |
++|---|---|---|---|
++| 1 | solver.py | 25 T airgap field, 800 kV back-EMF, zero torque | Six-bug fix: Carter reluctance formula, PM source term, mesh element tagging |
++| 2 | solver.py | Non-120° back-EMF phase separation | Winding phase assignment algorithm rewritten |
++| 3 | solver.py | Trapezoidal back-EMF waveform | Staircase winding function replaced with sinusoidal |
++| 4 | solver.py | Efficiency map showing >100% | Flux density calculation corrected |
++| 5 | Various | 4-pole motors broken | Hardcoded 12-slot pattern generalised |
++| 6 | back_emf_constant() | Formula 3.5× too high | Wrong reluctance fraction g/g_eff → t_m/(t_m+μ_r·g) |
++| 7 | torque | Static torque sign error | Sign convention fixed |
++| 8 | FEM stack | PM remanence never applied to mesh | Entire FEM replaced with validated Fourier solver |
++
++### Session 4–7 (2026-03-05 to 03-10) — Bohemien_Motor_Designer rebuild
++| # | File | Bug | Fix |
++|---|---|---|---|
++| 9 | winding.py | Winding factor calculation wrong | Distribution factor formula corrected |
++| 10 | materials/library.py | Steinmetz coefficients missing | BH curve tables added for M19/M270/M400/M800/Arnon5 |
++| 11 | thermal/lumped_model.py | Thermal ODE unstable | Implicit Euler integrator added |
++| 12 | utils/validation.py | Current density J formula used slot area not conductor area | Fixed to A_conductor = A_slot × ff / (N_coil × layers) |
++| 13 | py_solver.py | PM polarity sign wrong → all poles same direction | Sign alternation added per pole index |
++| 14 | py_runner.py | Arkkio torque giving wrong result | Replaced with Park torque from flux linkage derivatives |
++| 15 | gui/app.py | LabeledEntry missing delete/insert methods | Methods added |
++| 16 | gmsh_exporter.py | Slot geometry split incorrectly | Split into 2 surfaces per layer |
++| 17 | manufacturing_report.py | DRC J formula, B_gap formula, ISO tolerances, strand packing | 8 fixes across 4 files |
++
++### Session 8 (2026-04-02) — 3D FEM Phase 1 + PyInstaller
++| # | File | Bug | Fix |
++|---|---|---|---|
++| 18 | fea/solver3d.py | `np.stack(axis=1)` → wrong barycentric gradients → B field 50–100× too small | Changed to `axis=2` (edge vectors must be COLUMNS of T) |
++| 19 | fea/solver3d.py | Flux linkage had extra L² factor | `dpsi = N × sum(Az×dV) / (A_layer × L)` |
++| 20 | gui/app.py | `import tkinter` at module level → PyInstaller dropped module | All tkinter/matplotlib imports moved inside `main()` |
++| 21 | gui/__init__.py | `from .app import main` at module level | Deferred to wrapper function |
++| 22 | Bohemien_Motor_Designer/__init__.py | Eager imports chain → tkinter at analysis time | Lazy `__init__` (version string only) |
++| 23 | Bohemien_Motor_Designer.spec | `__file__` undefined in spec exec context | Use `SPECPATH` instead |
++| 24 | Bohemien_Motor_Designer.spec | `pathex=['.']` wrong — inside package dir | `pathex=[Path(SPECPATH).parent.resolve()]` |
++| 25 | build_exe.bat | Ran from inside Bohemien_Motor_Designer\ | Added `cd /d "%~dp0.."` |
++| 26 | gui/app.py | `\uXXXX` backslash escapes inside f-string `{}` expressions → SyntaxError Python 3.11 | Replaced all 15 occurrences with actual Unicode characters |
++| 27 | Bohemien_Motor_Designer.spec | `PIL` in excludes → matplotlib.colors imports PIL → ModuleNotFoundError at runtime | Removed PIL from excludes, added to hiddenimports |
++| 28 | fea/runner3d.py | Ld/Lq perturbation used Iq_rated background → Park projection error → Ld 1000× too large | Zero-background perturbation, reuse psi_d0=Ke_3d |
++
++### Session 9 (current session) — Packaging, CLA, agents, flux viz
++| # | File | Bug | Fix |
++|---|---|---|---|
++| 29 | gui/app.py | `import tkinter` still at module-level in old zip | Restructured: only stdlib at module level, tkinter inside `main()` |
++| 30 | Bohemien_Motor_Designer.spec | `__file__` in spec (again, different user's zip) | `SPECPATH` used throughout |
++| 31 | Bohemien_Motor_Designer.spec | `pathex` pointed to package folder not parent | `Path(SPECPATH).parent` |
++| 32 | gui/app.py | `\uXXXX` escapes in f-strings → Python 3.11 SyntaxError (reported from exe) | All 15 occurrences replaced with literal Unicode |
++| 33 | spec | `PIL` excluded → matplotlib crash at runtime | PIL removed from excludes, added to hiddenimports |
++| 34 | fea/py_runner.py | 2D Ld/Lq: Iq_rated background (172 A) contaminates δψ_d via Park projection error | Zero background current, dI=20 A fixed |
++| 35 | fea/runner3d.py | 3D dI = 0.05×Ke/Ld_est = 123 A → iron saturation | Fixed dI = 20 A |
++| 36 | bohemien_agent.py | Class names: LumpedThermalModel → ThermalNetwork, CoolingSystem → WaterJacketCooling | All class names corrected to match renamed package |
++
++
++### Session 10 (2026-11-03) — 2D/3D inductance reconciliation (the ">10×" discrepancy)
++Root cause was five stacked bugs, not end-winding leakage.  All verified on the reference motor
++with a stored-energy cross-check (L = 4W/3I², gauge-invariant, independent of flux-linkage bookkeeping).
++
++| # | File | Bug | Fix |
++|---|---|---|---|
++| 37 | core/geometry/winding.py | `total_series_turns_per_phase` divided by an extra 2 for double-layer windings → every analytical quantity used half the real turns (Ke 2× low, L 4× low). FEM summed the 32 coil sides correctly. | `N_series = coils_per_phase × N_coil / a`, `coils_per_phase = slots·layers/(2·phases)`. New `coils_per_phase` property. |
++| 38 | fea/py_solver.py, fea/solver3d.py | Current source `J = N_coil·I/(A_layer·ff)` — J is applied over the whole meshed slot area, so dividing by fill factor injected 1/ff = 2.08× too many ampere-turns | `J = N_coil·I/A_layer`. (Caught because L_energy/L_fluxlink = 1/ff exactly.) |
++| 39 | fea/py_mesh.py (×2), fea/mesh3d.py | Rotor inter-pole gaps (R_mi<r<R_ro outside magnet arc) tagged ROTOR_IRON → inset-magnet rotor with q-axis iron → Lq/Ld = 1.6–1.9 on an SPM | New `_rotor_air_tag` (= 3+poles+2), kept out of the Arkkio ring. Lq/Ld now 0.92. |
++| 40 | core/pmsm.py | Analytical `L_ag = (3/π²)μ0(Nkw)²τ_pL/g_c` — missing 1/p (right only for p=2; 2× high here). Slot leakage used 2m/Q not 4m/Q. Tooth-tip and harmonic leakage absent. | `L_ag=(6/π²)μ0(Nkw)²τ_pL/(p·g_c)`, `L_slot=(4m/Q)μ0LN²λ_slot`, `L_tt=(4m/Q)μ0LN²λ_tt`, `L_h=σ_δ·L_ag` (Pyrhönen 3.110/3.127/4.33/4.43). New `inductance_breakdown()`, `end_winding_leakage_inductance()` (Richter/Pyrhönen eq. 4.64, λ_lew=0.324, λ_W=0.243). |
++| 41 | fea/mesh3d.py | Single Freudenthal 5-tet template on every hex → **75 % of interior faces unshared** (non-conforming mesh): field leaks across cracks, current-driven L 25–30 % high and growing with refinement | `HEX_TO_TET_5_MIRROR` + checkerboard parity `(ir+it+iz)&1`. Zero cracks; ~25 % fewer edges. |
++| 42 | fea/mesh3d.py | End region outside the stack tagged rotor iron / stator iron ("iron block"); current source terminated at stack faces (not div-free) | End region = air; slot conductors continued straight to the axial boundary (`_end_coil_tag`, `elem_idx_ext`); A_t=0 Dirichlet added on z-faces. Default `n_end_winding=0` = pure extrusion. |
++| 43 | fea/solver3d.py | Spanning tree built from node 0 ignoring the Dirichlet boundary → interior tree paths between boundary nodes pinned to zero → spurious zero-flux constraints (field collapsed to 0 with z-face Dirichlet) | Boundary-first BFS tree (Manges & Cendes 1995): span the boundary graph with boundary edges first, then grow inward. |
++| 44 | fea/mesh3d.py `_outer_boundary` | "Both endpoints on boundary" also caught interior tet diagonals between a z-face node and a cylinder node | Edge is on the boundary only if both endpoints are on the **same** piece (cylinder, z0 face, or zL face). |
++| 45 | fea/solver3d.py `compute_flux_linkage_3d` | Divided by L_stack (returned Wb/m) and integrated A_z over the open in-stack segment — **gauge-dependent** under tree-cotree | ψ = N_coil·Σ(A_z·dV)/A_layer over the extended conductor (loop closes on the A_t=0 faces at zero cost). Verified = energy method to 4 digits. |
++| 46 | fea/runner3d.py | dI sized from Ke/Ld_est → 123 A (saturation) [from S9]; no cross-check | dI = 20 A; built-in energy-method Ld → `Ld_energy_check` (expect 1.000); reports `L_ew_mH`, `Ld_total_mH`, `L_2d_anal_mH`, `end_region_model`. |
++| 47 | fea/py_runner.py | No convergence information; no end-winding term; default 4 airgap layers (Ke 0.80×) | `_convergence_check()` (fine vs half-density mesh, flag ratio > 1.10); `L_ew_mH`, `Ld_total_mH`, analytical breakdown fields; default `n_radial_airgap=8`. |
++| 48 | gui/app.py | 3D tab claimed "end-winding effects included"; showed raw numbers only | Tab 8 and Tab 11 now show raw FEM, +L_ew, totals, analytical L_2d/L_total, 2D-vs-3D ratios with ✓/~/⚠ tags, energy check, mesh convergence. 3D defaults 8/2/8/0. 2D runner 12 ang × 8 AG. |
++| 49 | examples/full_design_example.py | 11 turns/coil "→ 88 series turns" — physically 176 turns, 2 kV back-EMF (DRC now flags it) | 1 turn/coil → 16 series turns, Ke 0.113, 190 V pk. |
++
++**Reconciliation result (reference motor, 12 ang/slot, 8 airgap layers):**
++
++| | Ke/Ke_anal | Ld (mH) | Lq (mH) | Ld+L_ew (mH) |
++|---|---|---|---|---|
++| 2D FEM | 1.001 | 0.0852 | 0.0784 | 0.0930 |
++| 3D FEM (pure extrusion) | 1.005 | 0.0857 | 0.0790 | 0.0935 |
++| Analytical (corrected) | 1.000 | 0.0833 | 0.0833 | 0.0911 |
++
++3D/2D on Ld = **1.006** (was > 10×). 3D solve now ~10 s at 170k edges (was 20 min).
++
++**What the literature says and what Bohemien now does with it:** 2D cannot see end-winding leakage
++(Chalmers ICEM 2024 / IECON 2025, Calvano COMPEL 2013: typically 5–30 % of L_sync, more for hairpin /
++short stacks). The 3D solver here is a pure extrusion, so it cannot see it either — it is a *check* on 2D,
++not an end-winding model. L_ew is added analytically (Richter/Pyrhönen, 8.5 % of total here, ±30–50 %)
++to both. Real end-turn geometry (circumferential arcs, loop closure) is a roadmap item; the
++straight-conductor `n_end_winding>0` option is labelled experimental because it adds the inductance of
++straight conductors in air (0.014 mH here), not end-turn leakage.
++
++---
++
++## Critical architecture decisions
++
++### PyInstaller — why it kept failing
++The failure chain that caused "No module named Bohemien_Motor_Designer.gui.app" three times:
++
++1. `app.py` had `import tkinter` at module level → PyInstaller's Linux build environment has no tkinter → module silently dropped from bundle
++2. `pathex=['.']` inside the package folder → `import Bohemien_Motor_Designer` looked for `Bohemien_Motor_Designer/Bohemien_Motor_Designer/` → not found
++3. `__file__` undefined in spec exec context → use `SPECPATH`
++4. `\uXXXX` inside f-string expressions → Python 3.11 SyntaxError → file silently dropped
++5. `PIL` in excludes list → matplotlib.colors imports PIL → runtime crash
++
++**The definitive build rule:** Always run `pyinstaller` from the **parent** of the package folder. `build_exe.bat` does this with `cd /d "%~dp0.."`.
++
++### 3D FEM — Nédélec edge elements
++- DOFs live on mesh edges, not nodes
++- `axis=2` in `np.stack()` — edge vectors must be COLUMNS of T (not rows)
++- Tree-cotree gauge removes curl-null space — the tree MUST be boundary-first (span the Dirichlet boundary with boundary edges, then grow inward) or Dirichlet+tree pin spurious interior loops
++- Hex→tet split MUST alternate template parity (checkerboard) or the mesh is non-conforming
++- Flux linkage: `ψ = N_coil × direction × Σ(A_z_cent × vol) / A_layer` over the EXTENDED conductor (gauge-invariant only as a closed loop; no /L_stack)
++- Always cross-check Ld with the stored-energy method L = 4W/3I² (gauge-invariant); `Ld_energy_check` in runner3d results
++- Zero-background perturbation for Ld/Lq — never use rated current as background
++
++### Inductance perturbation — universal rule
++Always use (and never divide the current source by the fill factor — J acts on the whole meshed slot area):
++- Background current: `Id=0, Iq=0` (no-load)
++- Baseline `ψ_d0 = Ke_fea` (reuse from no-load solve, saves one FEM call)
++- Perturbation: `dI = 20 A` fixed (well above noise floor ~0.001 mWb, well below saturation)
++- Solve `(dI, 0)` for Ld and `(0, dI)` for Lq
++
++### Class names after rename (Bohemien_Motor_Designer)
++| Wrong name (old) | Correct name (current) |
++|---|---|
++| `LumpedThermalModel` | `ThermalNetwork` |
++| `CoolingSystem(...)` | `WaterJacketCooling(...)` |
++| `thermal.winding_C` | `thermal.T_winding_C` |
++| `thermal.rotor_C` | `thermal.T_rotor_C` |
++| `LossBudget` | `LossBudget` ← unchanged |
++| `DesignRuleChecker` | `DesignRuleChecker` ← unchanged |
++
++---
++
++## FEM validated results (Session 10, reference motor, turns_per_coil = 1)
++
++### 2D convergence — airgap radial layers are the controlling parameter
++| n_ang | n_ag | nodes | Ke/Ke_anal | Ld_2d (mH) |
++|---|---|---|---|---|
++| 8 | 4 | 6 144 | 0.761 | 0.0606 |
++| 16 | 4 | 12 288 | 0.805 | 0.0681 |
++| 16 | 8 | 15 360 | 1.007 | 0.0845 |
++| 12 | 8–24 | 11–21 k | 0.98–1.00 | 0.0840–0.0852 |
++| 24 | 16 | 32 256 | 0.977 | 0.0832 |
++
++### 3D convergence (pure extrusion, n_axial = 2)
++| n_ang | n_ag | edges | time | Ke/Ke_anal | Ld_3d (mH) | energy check |
++|---|---|---|---|---|---|---|
++| 4 | 8 | 74 k | 4 s | 0.738 | 0.0653 | 1.0000 |
++| 8 | 8 | 112 k | 6 s | 0.961 | 0.0759 | 1.0000 |
++| 12 | 8 | 168 k | 9 s | 1.005 | 0.0857 | 1.0000 |
++| 12 | 16 | 237 k | 19 s | 0.981 | 0.0845 | 1.0000 |
++
++n_axial 1 → 4 changes Ld_3d by < 2 % (extrusion is axially consistent).
++
++### Analytical breakdown (corrected formulas)
++L_ag 0.0590 · L_h 0.0016 · L_slot 0.0144 · L_tt 0.0084 → **L_2d 0.0833 mH** · L_ew 0.0078 → **L_total 0.0911 mH**
++
++---
++
++## Licensing and CLA setup
++
++| Item | Status |
++|---|---|
++| License | MIT (in repo root as `LICENSE`) |
++| CLA.md | In repo root |
++| CONTRIBUTING.md | In repo root |
++| CLA enforcement | GitHub Actions `license/cla` status check (required to merge) |
++| Branch protection | main branch requires `license/cla` to pass |
++| CLA signer storage | `signatures/cla.json` in repo |
++| Jurisdiction | State of California, Contra Costa County |
++| Privacy Policy | Gist at gist.github.com |
++
++---
++
++## Agent (bohemien_agent.py)
++
++**Location:** repo root (same level as `Bohemien_Motor_Designer/`)
++
++**Run:**
++```powershell
++cd C:\Bohemien\https-github.com-gyaj-Bohemien
++python bohemien_agent.py
++```
++
++**How it imports the package:**
++Scans for `Bohemien_Motor_Designer/`, `Bohemien_Motor_Designer/`, `bohemien/` in the repo root. Uses `importlib.import_module(f"{_PKG}.submodule")` so it works regardless of what the folder is named.
++
++**Three tools exposed to Claude API:**
++1. `run_analytical` — calls PMSM.back_emf_constant(), LossCalculator, ThermalNetwork
++2. `check_design_rules` — calls DesignRuleChecker.check_all()
++3. `compare_candidates` — batch-evaluates multiple designs and ranks by efficiency
++
++**Rate-aware wrapper:** `RateAwareClient` reads `anthropic-ratelimit-tokens-remaining` header and sleeps until reset if budget is low. Safe for overnight runs.
++
++**Dependencies:** `pip install anthropic` (one new package; numpy/scipy already installed)
++
++---
++
++## Tab 12 — Flux Visualisation (Phase 1, implemented)
++
++**What was added to `gui/app.py`:**
++- Tab registration in `_build_ui()`
++- `_build_flux_tab(parent)` — builds controls strip + 3-panel figure
++- `_flux_run_async()` — launches background thread
++- `_flux_worker()` — mesh build + magnetostatic solve
++- `_flux_render(mesh, A_z, Bx, By, B_mag, motor, angle_deg)` — draws 3 panels
++- `_flux_animate_step()` — animation loop (advances rotor angle, re-solves)
++- `_flux_save()` — saves PNG/SVG/PDF
++
++**Three panels:**
++1. `tricontourf` + `tricontour` of A_z — exact flux lines (A_z isolines = flux lines in 2D)
++2. `tripcolor` of B_mag (gouraud) + geometry circles — saturation map
++3. B magnitude histogram per material region + saturation reference line at 1.8 T
++
++**Physics note:** A_z contours ARE the flux lines because B = curl(A_z ẑ), so B is tangent to A_z isolines. No interpolation needed — direct tricontour on nodal A_z values.
++
++---
++
++## Pending items (not yet implemented)
++
++| Item | Priority | Notes |
++|---|---|---|
++| Flux Viz Phase 2 | High | Streamplot via scipy.griddata + rotor angle slider live update |
++| Flux Viz Phase 3 | Medium | PyVista 3D streamlines + VTK export button |
++| IPM rotor topologies | Medium | V-type magnet barriers, GMSH Boolean subtract |
++| Induction motor | Medium | IM equivalent circuit + torque-speed curve + GUI tab |
++| 3D end-turn geometry | High | Circumferential end-turn arcs with loop closure so the 3D solver can actually resolve L_ew; validate against Richter/Pyrhönen and one commercial 3D FEM run |
++| Winding factor check | Low | `winding_factor()` returns 0.9914 for q=2 (textbook k_d = 0.966); Ke still matches FEM to 0.1 %, so investigate before changing |
++| 3D FEM iterative solver | Medium | pyamg for meshes >500k DOF (less urgent now: 170k-edge conforming mesh solves in ~10 s) |
++| 3D FEM sliding interface | Low | Cogging torque in 3D |
++| 3D FEM Phase 2 (IM) | Low | Time-harmonic A-V formulation, end-ring coupling |
++| Agent: FEM Interpreter | Medium | Runs FEM, diagnoses Ke/Ld discrepancies automatically |
++| Agent: Design Review | Medium | Checks DRC + produces written engineering report |
++| Agent: Rate-aware overnight | Low | Already in bohemien_agent.py as RateAwareClient |
++| Update design document | Low | Add flux viz and 3D FEM sections |
++| Have IP lawyer review CLA | High (before revenue) | California jurisdiction, Contra Costa County |
++| Register trademark | Medium | Before commercial launch |
++
++---
++
++## How to continue development in a new chat
++
++**Paste this entire file** as your first message, then say what you want to work on. For example:
++
++> *"[paste this file] I want to implement Phase 2 of the flux visualisation tab — streamplot with live rotor angle slider."*
++
++Claude will read the log, understand the codebase state, and continue from exactly where we left off.
++
++**After each session**, ask Claude:
++> *"Update DEVELOPMENT_LOG.md with what we changed today."*
++
++Claude will output the updated sections to paste back into this file.
++
++---
++
++*Last updated: Session 10 — 3 Nov 2026*
++*Total bugs fixed across all sessions: 49*
++*Total Python files: 63 across 11 subpackages (incl. tests/)*
++*GUI lines of code: 2,252*
++*Test suite: `python -m pytest Bohemien_Motor_Designer/tests` — 7 passed in ~17 s*
+diff --git a/Bohemien_Motor_Designer/core/geometry/winding.py b/Bohemien_Motor_Designer/core/geometry/winding.py
+index 88af496..ae118c1 100644
+--- a/Bohemien_Motor_Designer/core/geometry/winding.py
++++ b/Bohemien_Motor_Designer/core/geometry/winding.py
+@@ -221,16 +221,31 @@ class WindingLayout:
+             kd = 1.0
+         return abs(kd)
+ 
++    @property
++    def coils_per_phase(self) -> int:
++        """Number of coils per phase.
++
++        A coil has two sides.  Each slot holds `layers` coil sides, so the
++        machine has  slots × layers / 2  coils in total, of which 1/phases
++        belong to each phase:
++            single-layer (layers=1): slots / (2·phases)      e.g. 48s → 8
++            double-layer (layers=2): slots / phases          e.g. 48s → 16
++        """
++        return (self.slots * self.layers) // (2 * self.phases)
++
+     @property
+     def total_series_turns_per_phase(self) -> int:
+         """Total series turns per phase [turns].
+-        Each slot has one going coil side per phase. Coils are series/parallel_paths.
+-        For 2-layer: each slot contributes 1 coil side (going), return is in another slot.
++
++            N_series = coils_per_phase × turns_per_coil / parallel_paths
++
++        This must match the number of conductor passes the FEM sums over:
++        the layout table lists 2·coils_per_phase coil sides per phase, each
++        carrying turns_per_coil conductors.  (An earlier version divided by
++        an extra factor of 2 for double-layer windings — the FEM was right
++        and the analytical Ke was low by 2×, Ld/Lq by 4×.)
+         """
+-        # Number of coils per phase = slots / phases  (one coil-side per slot per layer,
+-        # but each coil occupies 2 slots so coils_per_phase = slots/phases/layers * layers = slots/phases)
+-        coils_per_phase = self.slots // self.phases
+-        return (coils_per_phase * self.turns_per_coil) // (self.parallel_paths * 2)
++        return (self.coils_per_phase * self.turns_per_coil) // self.parallel_paths
+ 
+     # ── Diagnostics ──────────────────────────────────────────────────────
+ 
+diff --git a/Bohemien_Motor_Designer/core/pmsm.py b/Bohemien_Motor_Designer/core/pmsm.py
+index 89e3fa2..af71a3a 100644
+--- a/Bohemien_Motor_Designer/core/pmsm.py
++++ b/Bohemien_Motor_Designer/core/pmsm.py
+@@ -226,7 +226,151 @@ class PMSM(Motor):
+         Id = (-b - np.sqrt(disc)) / (2 * a)   # take the negative (demagnetising) root
+         return Id
+ 
+-    # ── Analytical inductance computation ────────────────────────────────
++    # ── Analytical inductance components ─────────────────────────────────
++
++    def _end_winding_geometry(self) -> tuple[float, float]:
++        """
++        (W_ew, l_ew) in metres for the end-winding leakage model.
++
++        W_ew : coil span measured at the slot mid-depth radius.  For a
++               full-pitch coil this is one pole pitch at that radius.
++        l_ew : axial extent of the end winding (stack face to the coil
++               nose).  Diamond-shaped distributed coils leave the slot at
++               roughly 45°, so the nose sits about W_ew/2 out, plus a
++               straight run for the bend radius and insulation.
++        Both can be overridden by setting motor.end_winding_span_m and
++        motor.end_winding_axial_m (e.g. from a measured coil).
++        """
++        p   = self.pole_pairs
++        r_m = self.rotor_outer_radius + self.airgap
++        if self.stator is not None:
++            r_m += 0.5 * self.stator.slot_profile.depth()
++        W_ew = getattr(self, "end_winding_span_m", None) \
++               or (np.pi * r_m / p) * getattr(self, "coil_pitch_fraction", 1.0)
++        l_ew = getattr(self, "end_winding_axial_m", None) \
++               or (0.5 * W_ew + 0.010)
++        return float(W_ew), float(l_ew)
++
++    def end_winding_leakage_inductance(self) -> float:
++        """
++        End-winding leakage inductance per phase [H] — the component that a
++        2D (cross-section) FEM cannot see.
++
++        Method: Richter's permeance-factor formula as given in Pyrhönen,
++        Jokinen & Hrabovcová, *Design of Rotating Electrical Machines*,
++        2nd ed., §4.3.3, eq. (4.64):
++
++            L_ew = (4·m / Q) · q · N² · μ0 · l_w·λ_w
++                 = (2 / p) · N² · μ0 · (2·l_ew·λ_lew + W_ew·λ_W)
++
++        where m = phases, Q = slots, q = slots per pole per phase,
++        N = series turns per phase, p = pole pairs, and the permeance
++        factors (Table 4.5, two-layer diamond winding) are
++            λ_lew = 0.324   (axial part of the overhang)
++            λ_W   = 0.243   (circumferential part / coil span)
++
++        Accuracy: empirical, ±30–50 %.  Published 3D-FEM studies put L_ew
++        at roughly 5–30 % of the total synchronous inductance for radial-
++        flux distributed-winding PMSMs (Chalmers ICEM 2024 / IECON 2025;
++        Calvano et al. COMPEL 2013), higher for hairpin and short-stack
++        machines.  A single 3D end-turn FEM at the final design point is
++        the usual way to tighten this number.
++        """
++        MU0 = 4e-7 * np.pi
++        p   = self.pole_pairs
++        N   = self.winding.total_series_turns_per_phase
++        W_ew, l_ew = self._end_winding_geometry()
++        lam_lew = getattr(self, "lambda_end_axial", 0.324)
++        lam_W   = getattr(self, "lambda_end_span",  0.243)
++        return float((2.0 / p) * MU0 * N**2 * (2.0 * l_ew * lam_lew + W_ew * lam_W))
++
++    def inductance_breakdown(self) -> dict:
++        """
++        Analytical synchronous-inductance components per phase [H]:
++
++            L_ag    air-gap (magnetising) inductance — fundamental
++            L_h     air-gap harmonic leakage (MMF space harmonics)
++            L_slot  slot leakage
++            L_tt    tooth-tip leakage (across the slot opening)
++            L_ew    end-winding leakage  (3D-only; absent from 2D FEM)
++            L_2d    = L_ag + L_h + L_slot + L_tt   what a 2D FEM sees
++            L_total = L_2d + L_ew                  what the machine has
++
++        A 2D FEM result must be compared with L_2d, not L_total.
++        Validated against the pure-Python 2D FEM on the reference 8p/48s
++        30 kW SPM: L_2d analytical 0.0833 mH vs FEM 0.0845 mH (1.4 %).
++        """
++        c = self._airgap_and_slot_inductance()
++        L_ew = self.end_winding_leakage_inductance()
++        L_2d = c["L_ag"] + c["L_h"] + c["L_slot"] + c["L_tt"]
++        return dict(**c, L_ew=L_ew, L_2d=L_2d, L_total=L_2d + L_ew,
++                    L_ew_fraction=L_ew / (L_2d + L_ew + 1e-30))
++
++    def _airgap_and_slot_inductance(self) -> dict:
++        """
++        Inductance components per phase [H] for the isotropic (SPM) case,
++        following Pyrhönen, Jokinen & Hrabovcová, *Design of Rotating
++        Electrical Machines*, 2nd ed., chapters 3–4:
++
++          L_ag   = (6/π²) · μ0 · (N·kw1)² · τ_p · L / (p · g_c)        (3.110)
++                   [= (3/2) × single-phase (4/π²)·μ0(Nkw)²τ_p L/(p g_c)]
++          L_h    = σ_δ · L_ag,   σ_δ = Σ_{ν≠1} (kw_ν / (ν·kw1))²      (3.127)
++          L_slot = (4m/Q) · μ0 · L · N² · λ_slot                      (4.33)
++                   λ_slot = h_s/(3 b_s) + h_wedge/b_open
++          L_tt   = (4m/Q) · μ0 · L · N² · λ_tt                        (4.43)
++                   λ_tt = (5 g_eff/b_open) / (5 + 4 g_eff/b_open)
++
++        Note the explicit 1/p in L_ag and the 4m/Q (not 2m/Q) in the
++        slot-leakage term; the previous version of this routine had
++        (3/π²)/g_c and 2m/Q, which is only right for p = 2.
++        """
++        MU0   = 4e-7 * np.pi
++        p     = self.pole_pairs
++        m_ph  = self.phases
++        Q     = self.slots
++        N     = self.winding.total_series_turns_per_phase
++        kw1   = self.winding_factor()
++        L_stk = self.stack_length
++        r_i   = self.rotor_outer_radius
++        tau_p = np.pi * r_i / p
++
++        rg    = self.rotor_geo
++        t_m   = getattr(rg, "magnet_thickness", self.magnet_thickness)
++        g_eff = self.airgap + t_m / self._mu_r
++        b_op  = self.stator.slot_profile.opening_width() if self.stator else 0.003
++        gamma = (b_op / g_eff)**2 / (5 + b_op / g_eff)
++        kc    = tau_p / (tau_p - gamma * g_eff)
++        g_c   = kc * g_eff
++
++        L_ag = (6.0 / np.pi**2) * MU0 * (N * kw1)**2 * tau_p * L_stk / (p * g_c)
++
++        # Air-gap harmonic leakage factor from the winding's space harmonics
++        q      = Q / (2.0 * p * m_ph)
++        alpha  = 2.0 * np.pi * p / Q             # slot angle [rad elec]
++        q_int  = max(1, int(round(q)))
++        sigma  = 0.0
++        for nu in range(5, 400, 2):
++            if nu % 3 == 0:
++                continue
++            kd_nu = np.sin(nu * q_int * alpha / 2) / (q_int * np.sin(nu * alpha / 2) + 1e-15)
++            sigma += (kd_nu / (nu * kw1 + 1e-15))**2
++        L_h = sigma * L_ag
++
++        if self.stator:
++            sp    = self.stator.slot_profile
++            h_s   = sp.depth()
++            b_s_w = sp.area() / (h_s + 1e-9)
++            h_w   = getattr(sp, "wedge_height", 0.0)
++            lam_slot = h_s / (3.0 * b_s_w + 1e-9) + (h_w / (b_op + 1e-9))
++        else:
++            lam_slot = 0.5
++        lam_tt = (5.0 * g_eff / b_op) / (5.0 + 4.0 * g_eff / b_op)
++
++        L_slot = (4.0 * m_ph / Q) * MU0 * L_stk * N**2 * lam_slot
++        L_tt   = (4.0 * m_ph / Q) * MU0 * L_stk * N**2 * lam_tt
++        return dict(L_ag=float(L_ag), L_h=float(L_h),
++                    L_slot=float(L_slot), L_tt=float(L_tt),
++                    sigma_delta=float(sigma), g_c=float(g_c))
+ 
+     def _compute_inductances(self) -> tuple[float, float]:
+         """
+@@ -244,7 +388,9 @@ class PMSM(Motor):
+                 The saliency ratio Lq/Ld is estimated from barrier geometry.
+ 
+         All leakage terms (slot, tooth-tip, end-winding) use standard
+-        permeance coefficient formulae.
++        permeance coefficient formulae — see inductance_breakdown() for
++        the individual components and end_winding_leakage_inductance()
++        for the L_ew model and its literature basis.
+         """
+         MU0   = 4e-7 * np.pi
+         p     = self.pole_pairs
+@@ -254,42 +400,20 @@ class PMSM(Motor):
+         r_i   = self.rotor_outer_radius          # bore inner radius ≈ rotor OD
+         tau_p = np.pi * r_i / p                  # pole pitch [m]
+ 
+-        # --- Effective air gap (Carter + magnet layer) ---
+         rg    = self.rotor_geo
+-        t_m   = getattr(rg, "magnet_thickness", self.magnet_thickness)
+         mu_r  = self._mu_r
+-        g_eff = self.airgap + t_m / mu_r         # magnetically effective gap [m]
+-
+-        # Carter factor for slot opening
++        t_m   = getattr(rg, "magnet_thickness", self.magnet_thickness)
++        g_eff = self.airgap + t_m / mu_r
+         b_s   = self.stator.slot_profile.opening_width() if self.stator else 0.003
+         gamma = (b_s / g_eff)**2 / (5 + b_s / g_eff)
+         kc    = tau_p / (tau_p - gamma * g_eff)
+-        g_c   = kc * g_eff                       # Carter-corrected gap
+-
+-        # --- Fundamental air-gap inductance ---
+-        # L_ag = (3/pi^2) * mu0 * (N*kw)^2 * tau_p * L / g_c
+-        L_ag = (3.0 / np.pi**2) * MU0 * (N * kw1)**2 * tau_p * L_stk / g_c
+-
+-        # --- Slot leakage permeance coefficient ---
+-        # Lambda_slot ≈ h_slot/(3*b_slot) + h_wedge/b_wedge  (parallel-tooth approx)
+-        if self.stator:
+-            sp    = self.stator.slot_profile
+-            h_s   = sp.depth()
+-            b_s_w = sp.area() / (h_s + 1e-9)    # mean slot width
+-            b_op  = sp.opening_width()
+-            h_w   = getattr(sp, "wedge_height", 0.0)
+-            lam_slot = h_s / (3.0 * b_s_w + 1e-9) + (h_w / (b_op + 1e-9))
+-        else:
+-            lam_slot = 0.5                        # generic default
+-
+-        q     = self.slots / (self.poles * self.phases)   # slots/pole/phase
+-        L_slot = 2 * MU0 * L_stk * N**2 * lam_slot / (self.slots / self.phases)
+-
+-        # --- End-winding leakage (Richter formula, simplified) ---
+-        # L_ew ≈ 0.3 * mu0 * N^2 * tau_p  (per phase)
+-        L_ew  = 0.3 * MU0 * N**2 * tau_p / (self.poles / 2)
++        g_c   = kc * g_eff                       # Carter-corrected gap (IPM branch)
+ 
+-        L_leak = L_slot + L_ew
++        # Shared components (single source of truth)
++        c      = self._airgap_and_slot_inductance()
++        L_ag   = c["L_ag"]
++        L_ew   = self.end_winding_leakage_inductance()
++        L_leak = c["L_h"] + c["L_slot"] + c["L_tt"] + L_ew
+ 
+         # --- Topology-specific d/q split ---
+         if isinstance(rg, IPMRotorGeometry) and rg.barriers:
+@@ -297,11 +421,12 @@ class PMSM(Motor):
+             w_m     = b.magnet_width
+             t_m_ipm = b.magnet_thickness
+             mu_r_m  = mu_r
++            K_ag    = (6.0 / np.pi**2) * MU0 * (N * kw1)**2 * tau_p * L_stk / p
+ 
+             # d-axis: flux crosses magnet (high reluctance)
+             # Extra reluctance of magnet layer on d-axis
+             g_d = g_c + t_m_ipm / mu_r_m
+-            L_ag_d = (3.0 / np.pi**2) * MU0 * (N * kw1)**2 * tau_p * L_stk / g_d
++            L_ag_d = K_ag / g_d
+ 
+             # q-axis: flux through iron bridge / flux guides
+             # Barrier blocks a fraction of the q-axis MMF
+@@ -309,7 +434,7 @@ class PMSM(Motor):
+             alpha_m = min(0.95, w_m / (tau_p + 1e-9))
+             # Effective q-axis reluctance reduced by iron path fraction
+             g_q = g_c * (1.0 - alpha_m) + g_c * alpha_m * 0.1  # iron path ≈ 10× lower Rm
+-            L_ag_q = (3.0 / np.pi**2) * MU0 * (N * kw1)**2 * tau_p * L_stk / g_q
++            L_ag_q = K_ag / g_q
+ 
+             Ld = L_ag_d + L_leak
+             Lq = L_ag_q + L_leak
+diff --git a/Bohemien_Motor_Designer/examples/full_design_example.py b/Bohemien_Motor_Designer/examples/full_design_example.py
+index 517d534..00dbf85 100644
+--- a/Bohemien_Motor_Designer/examples/full_design_example.py
++++ b/Bohemien_Motor_Designer/examples/full_design_example.py
+@@ -135,14 +135,18 @@ def main():
+         sleeve_material      = "carbon_fibre",
+     )
+ 
+-    # Winding: 8p/48s, double-layer, 11 turns/coil, 1 parallel path
+-    # → 88 series turns/phase → Ke = 0.109 V·s/rad → back-EMF 183V @ 4000rpm
++    # Winding: 8p/48s, double-layer, 1 turn/coil, 1 parallel path.
++    # Double-layer 48 slots = 48 coils, 16 per phase → N_series = 16 × 1 = 16
++    # → Ke = 0.113 V·s/rad → peak back-EMF 190 V @ 4000 rpm (400 V bus).
++    # (Before Nov-2026 the turns formula halved N_series for double-layer
++    #  windings, so this example carried 11 turns/coil and reported 88; the
++    #  physical winding it described had 176 turns and 2 kV back-EMF.)
+     winding = WindingLayout(
+         poles          = 8,
+         slots          = 48,
+         phases         = 3,
+         layers         = 2,
+-        turns_per_coil = 11,
++        turns_per_coil = 1,
+         parallel_paths = 1,
+     )
+ 
+@@ -160,7 +164,7 @@ def main():
+         magnet_material    = "N42SH",
+         magnet_thickness   = 0.006,
+         magnet_width_fraction = 0.83,
+-        turns_per_coil     = 11,
++        turns_per_coil     = 1,
+         conductor_diameter = 0.0009,   # 0.9mm wire, ~77A rated
+         slot_fill_factor   = 0.48,
+         parallel_paths     = 1,
+diff --git a/Bohemien_Motor_Designer/fea/mesh3d.py b/Bohemien_Motor_Designer/fea/mesh3d.py
+index 509c6cb..7d9fb75 100644
+--- a/Bohemien_Motor_Designer/fea/mesh3d.py
++++ b/Bohemien_Motor_Designer/fea/mesh3d.py
+@@ -49,13 +49,32 @@ from typing import Optional
+ TAG_STATOR_IRON = 1
+ TAG_ROTOR_IRON  = 2
+ TAG_PM_BASE     = 3
+-TAG_END_WINDING = 500
++TAG_END_WINDING = 500      # end-region AIR (everything outside the stack that
++                           # is not a continued conductor).  Name kept for
++                           # backward compatibility with mesh summaries.
++TAG_END_COIL    = 600      # base: slot conductor continued axially past the
++                           # stack face (600 + slot*2 + layer)
+ 
+ def _pm_tag(pole: int) -> int:       return TAG_PM_BASE + pole
+ def _shaft_tag(poles: int) -> int:   return TAG_PM_BASE + poles
+ def _airgap_tag(poles: int) -> int:  return TAG_PM_BASE + poles + 1
++def _rotor_air_tag(poles: int) -> int: return TAG_PM_BASE + poles + 2
+ def _winding_tag(slot: int, layer: int, Qs: int) -> int:
+     return 200 + (slot % Qs) * 2 + layer
++def _end_coil_tag(slot: int, layer: int, Qs: int) -> int:
++    return TAG_END_COIL + (slot % Qs) * 2 + layer
++
++# End-region modelling note
++# -------------------------
++# The real end turn leaves the stack, bends circumferentially and re-enters
++# another slot.  Meshing that loop is a separate project.  Here the slot
++# conductors are continued *straight* through the end region to the axial
++# boundary, so the current source is divergence-free inside the domain, and
++# everything else outside the stack is air.  This is the standard "2.5-D"
++# model: it captures axial fringing at the stack faces but NOT end-winding
++# leakage.  L_ew is therefore added analytically (PMSM.end_winding_leakage_
++# inductance) to both the 2D and 3D results, and the expected unit-test
++# relation is   Ld_3D ≈ Ld_2D  to within a few percent.
+ 
+ # 5-tet Freudenthal decomposition of a hexahedron.
+ # Hex corner numbering:
+@@ -69,6 +88,24 @@ HEX_TO_TET_5 = np.array([
+     [3, 1, 4, 6],   # tet 4  (centre)
+ ], dtype=np.int32)
+ 
++# Mirror image of HEX_TO_TET_5 (reflected in the angular direction, node
++# order adjusted so every tet keeps positive volume).  Its face diagonals
++# are the complementary set: on each of the six hex faces it uses the
++# OTHER diagonal.  The two templates must be applied in a checkerboard
++# pattern, parity = (ir + it + iz) mod 2, so that any two neighbouring
++# hexes put the same diagonal on their shared face.  Using a single
++# template everywhere leaves ~75 % of interior faces unshared ("cracks"):
++# the edge-element space is then non-conforming, the field leaks across
++# the cracks, and current-driven inductances come out 25–30 % high and
++# grow with mesh refinement.  (Verified on the reference motor.)
++HEX_TO_TET_5_MIRROR = np.array([
++    [0, 1, 5, 2],
++    [3, 0, 7, 2],
++    [5, 0, 7, 4],
++    [5, 2, 6, 7],
++    [2, 0, 7, 5],   # centre
++], dtype=np.int32)
++
+ # All 6 local edges of a tetrahedron (node-pair indices)
+ TET_LOCAL_EDGES = np.array([
+     [0, 1], [0, 2], [0, 3],
+@@ -233,7 +270,12 @@ def build_motor_mesh_3d(
+                     in_stack=in_stack,
+                 )
+ 
+-                for local_tet in HEX_TO_TET_5:
++                # Checkerboard split parity → conforming tet mesh (see the
++                # note at HEX_TO_TET_5_MIRROR).  n_theta is always even
++                # (Qs × n_ang), so the parity is consistent around the ring.
++                template = (HEX_TO_TET_5 if ((ir + it + iz) & 1) == 0
++                            else HEX_TO_TET_5_MIRROR)
++                for local_tet in template:
+                     tets_list.append(hex_n[local_tet])
+                     tags_list.append(tag)
+ 
+@@ -288,17 +330,34 @@ def _classify_3d(r, th, z, *, poles, R_shaft, R_mi, R_ro, R_si, R_so,
+                   stack_length, rotor_angle=0.0, in_stack=True) -> int:
+     """Classify a 3D element by its centroid (r, th, z)."""
+ 
+-    # End-winding region (outside active stack)
++    def _slot_hit():
++        """(slot_index, layer) if (r, th) is inside a slot conductor region,
++        else None.  Shared by the in-stack and end-region branches so the
++        continued conductor has exactly the slot cross-section."""
++        if r < R_si * 0.999 or r > R_so * 0.999:
++            return None
++        sp   = 2 * np.pi / Qs
++        si   = int(th / sp) % Qs
++        dth  = th - (si + 0.5) * sp
++        re   = max(r, R_si + 1e-6)
++        a_op = np.arcsin(min(b_open / (2 * R_si), 0.9999))
++        a_sl = np.arcsin(min(b_slot / (2 * re), 0.9999))
++        in_op = (r < R_si + h_wedge + 1e-4) and (abs(dth) < a_op)
++        in_sl = (r >= R_si + h_wedge - 1e-4) and (abs(dth) < a_sl)
++        if (in_op or in_sl) and r < R_si + h_slot + 1e-4:
++            return si, (0 if r < R_si + h_slot / 2 else 1)
++        return None
++
++    # ── End region (outside active stack) ─────────────────────────────────
++    # Neither rotor nor stator iron extends axially.  Everything is air
++    # except the slot conductors, which are continued straight to the axial
++    # boundary so that the current source is divergence-free.  See the
++    # end-region modelling note at the top of this file.
+     if not in_stack:
+-        # Only stator copper overhangs exist outside the stack.
+-        # Everything else (rotor, stator iron) doesn't extend axially.
+-        if r > R_si:
+-            return TAG_END_WINDING   # stator winding overhang region
+-        if r < R_shaft * 1.01:
+-            return _shaft_tag(poles)
+-        if r < R_ro * 1.001:
+-            return TAG_ROTOR_IRON    # rotor/shaft in end region (if we model it)
+-        return TAG_STATOR_IRON       # end-winding support / air classified as stator
++        hit = _slot_hit()
++        if hit is not None:
++            return _end_coil_tag(hit[0], hit[1], Qs)
++        return TAG_END_WINDING          # air
+ 
+     # ── Active stack region ───────────────────────────────────────────────
+     if r < R_shaft * 1.01:
+@@ -317,7 +376,7 @@ def _classify_3d(r, th, z, *, poles, R_shaft, R_mi, R_ro, R_si, R_so,
+         pole_ang = th_r % pp
+         if abs(pole_ang - np.pi / poles) < half_m:
+             return _pm_tag(int(th_r / pp) % poles)
+-        return TAG_ROTOR_IRON
++        return _rotor_air_tag(poles)    # inter-pole gap: air, not iron
+ 
+     if r < R_si * 0.999:
+         return _airgap_tag(poles)
+@@ -325,19 +384,9 @@ def _classify_3d(r, th, z, *, poles, R_shaft, R_mi, R_ro, R_si, R_so,
+     if r > R_so * 0.999:
+         return TAG_STATOR_IRON
+ 
+-    # Stator slot or tooth
+-    sp      = 2 * np.pi / Qs
+-    si      = int(th / sp) % Qs
+-    dth     = th - (si + 0.5) * sp
+-    re      = max(r, R_si + 1e-6)
+-    a_op    = np.arcsin(min(b_open / (2 * R_si), 0.9999))
+-    a_sl    = np.arcsin(min(b_slot / (2 * re), 0.9999))
+-    in_op   = (r < R_si + h_wedge + 1e-4) and (abs(dth) < a_op)
+-    in_sl   = (r >= R_si + h_wedge - 1e-4) and (abs(dth) < a_sl)
+-    if (in_op or in_sl) and r < R_si + h_slot + 1e-4:
+-        lyr = 0 if r < R_si + h_slot / 2 else 1
+-        return _winding_tag(si, lyr, Qs)
+-
++    hit = _slot_hit()
++    if hit is not None:
++        return _winding_tag(hit[0], hit[1], Qs)
+     return TAG_STATOR_IRON
+ 
+ 
+@@ -474,13 +523,29 @@ def _outer_boundary(nodes, edges, r_outer: float):
+     Find nodes and edges on the outer cylindrical surface (r ≈ R_so).
+     These get A_tangential = 0 Dirichlet BC.
+     """
++    # Domain boundary = outer cylinder (r ≈ R_so) + both axial end faces.
++    # Without the z-face condition the natural BC applies there (n × H = 0),
++    # which models an infinitely-permeable plate pressed against each end of
++    # the machine and exaggerates end-region inductance.  A_t = 0 (B_n = 0,
++    # "flux-parallel") is the standard far-field truncation.
+     r_nodes = np.sqrt(nodes[:, 0]**2 + nodes[:, 1]**2)
+-    outer_node_mask = r_nodes > r_outer
++    z       = nodes[:, 2]
++    tol     = 1e-9
++    on_cyl  = r_nodes > r_outer
++    on_z0   = z < z.min() + tol
++    on_zL   = z > z.max() - tol
++    outer_node_mask = on_cyl | on_z0 | on_zL
+     outer_nodes = np.where(outer_node_mask)[0].astype(np.int32)
+ 
+-    # Edges where BOTH nodes are on the outer surface
+-    on_outer = outer_node_mask
+-    outer_edge_mask = on_outer[edges[:, 0]] & on_outer[edges[:, 1]]
++    # An edge lies ON the boundary only if both endpoints are on the SAME
++    # boundary piece.  "Both endpoints somewhere on the boundary" would also
++    # catch interior tet diagonals that run from a z-face node to a
++    # cylinder node (or, with one axial layer, from face to face); pinning
++    # those imposes spurious interior constraints.
++    a, b = edges[:, 0], edges[:, 1]
++    outer_edge_mask = ((on_cyl[a] & on_cyl[b]) |
++                       (on_z0[a]  & on_z0[b])  |
++                       (on_zL[a]  & on_zL[b]))
+     outer_edges = np.where(outer_edge_mask)[0].astype(np.int32)
+ 
+     return outer_nodes, outer_edges
+@@ -528,14 +593,17 @@ def _build_coil_data_3d(motor, tags, tets, Qs, stack_length) -> list:
+         return coil_data
+ 
+     for slot_idx, layer, phase, direction in layout:
+-        t    = _winding_tag(slot_idx % Qs, layer, Qs)
+-        idx  = np.where(tags == t)[0]
++        t     = _winding_tag(slot_idx % Qs, layer, Qs)
++        t_ext = _end_coil_tag(slot_idx % Qs, layer, Qs)
++        idx     = np.where(tags == t)[0]                     # in-stack only
++        idx_ext = np.where((tags == t) | (tags == t_ext))[0] # + end continuation
+         if len(idx) == 0:
+             continue
+         coil_data.append(dict(
+             slot=slot_idx % Qs, layer=layer,
+             phase=phase, direction=direction,
+-            elem_idx=idx,
++            elem_idx=idx,          # flux linkage: active stack only
++            elem_idx_ext=idx_ext,  # current source: stack + axial continuation
+         ))
+     return coil_data
+ 
+@@ -559,7 +627,8 @@ def mesh_report_3d(mesh: MotorMesh3D) -> str:
+         (TAG_ROTOR_IRON,    "Rotor iron"),
+         (_shaft_tag(poles), "Shaft"),
+         (_airgap_tag(poles),"Air gap"),
+-        (TAG_END_WINDING,   "End-winding"),
++        (_rotor_air_tag(poles), "Inter-pole air"),
++        (TAG_END_WINDING,   "End-region air"),
+     ]:
+         c = int((mesh.tags == tag).sum())
+         if c:
+@@ -567,9 +636,12 @@ def mesh_report_3d(mesh: MotorMesh3D) -> str:
+     pm_cnt = int(sum((mesh.tags == _pm_tag(p)).sum() for p in range(poles)))
+     if pm_cnt:
+         lines.append(f"  {'PM bodies':<18}: {pm_cnt:6,} tets")
+-    wc = int((mesh.tags >= 200).sum() & (mesh.tags < 500).sum())
++    wc = int(((mesh.tags >= 200) & (mesh.tags < 500)).sum())
+     if wc:
+         lines.append(f"  {'Winding slots':<18}: {wc:6,} tets")
++    ec = int((mesh.tags >= TAG_END_COIL).sum())
++    if ec:
++        lines.append(f"  {'End conductors':<18}: {ec:6,} tets")
+     lines.append(f"  Airgap faces    : {len(mesh.airgap_faces):,} triangles")
+     lines.append(f"  Outer BC edges  : {len(mesh.outer_edges):,}")
+     return "\n".join(lines)
+diff --git a/Bohemien_Motor_Designer/fea/py_mesh.py b/Bohemien_Motor_Designer/fea/py_mesh.py
+index e9ce7d2..4beabd1 100644
+--- a/Bohemien_Motor_Designer/fea/py_mesh.py
++++ b/Bohemien_Motor_Designer/fea/py_mesh.py
+@@ -27,6 +27,12 @@ _TAG_WINDING     = 200
+ def _pm_tag(pole):       return _TAG_PM_BASE + pole
+ def _airgap_tag(poles):  return 3 + poles + 1
+ def _shaft_tag(poles):   return 3 + poles
++def _rotor_air_tag(poles): return 3 + poles + 2
++# Rotor air = the inter-pole gaps between surface magnets (R_mi < r < R_ro,
++# outside the magnet arc).  Physically air / non-magnetic filler.  It must NOT
++# be tagged as rotor iron: iron there creates q-axis salient poles (an inset-
++# magnet rotor), giving Lq >> Ld on a machine that should have Lq ≈ Ld.
++# Kept distinct from _airgap_tag so the Arkkio torque ring is unaffected.
+ def _winding_tag(s, lyr, Qs): return _TAG_WINDING + (s % Qs) * 2 + lyr
+ 
+ 
+@@ -86,12 +92,15 @@ class MotorMesh:
+             in_mag_th = np.abs(pole_ang - np.pi/poles) < half_mag
+             pm        = in_mag_r & in_mag_th
+             pole_idx  = (th_rotor / pp).astype(int) % poles
++            # Inter-pole gap in the magnet band is air, not iron
++            new_tags[in_mag_r & ~in_mag_th] = _rotor_air_tag(poles)
+             new_tags[pm] = _TAG_PM_BASE + pole_idx[pm]
+ 
+         self.tags[idx] = new_tags
+         for p in range(poles):
+             self.groups[_pm_tag(p)] = np.where(self.tags == _pm_tag(p))[0]
+         self.groups[_TAG_ROTOR_IRON] = np.where(self.tags == _TAG_ROTOR_IRON)[0]
++        self.groups[_rotor_air_tag(poles)] = np.where(self.tags == _rotor_air_tag(poles))[0]
+ 
+ 
+ # ── Builder ────────────────────────────────────────────────────────────────────
+@@ -196,7 +205,7 @@ def _classify(r, th, *, poles, R_shaft, R_mi, R_ro, R_si, R_so,
+         pp     = 2*np.pi/poles
+         if abs(th_r % pp - np.pi/poles) < np.pi*alpha_p/poles:
+             return _TAG_PM_BASE + int(th_r/pp) % poles
+-        return _TAG_ROTOR_IRON
++        return _rotor_air_tag(poles)       # inter-pole gap: air, not iron
+ 
+     if r < R_si*0.999:
+         return _airgap_tag(poles)
+@@ -286,7 +295,8 @@ def mesh_report(mesh: MotorMesh) -> str:
+     poles = mesh._mesh_meta.get("poles", 0)
+     lines = [f"Motor mesh: {mesh.n_nodes} nodes  {mesh.n_elems} elements"]
+     for tag, name in [(1,"Stator iron"),(2,"Rotor iron"),
+-                      (_shaft_tag(poles),"Shaft"),(_airgap_tag(poles),"Air gap")]:
++                      (_shaft_tag(poles),"Shaft"),(_airgap_tag(poles),"Air gap"),
++                      (_rotor_air_tag(poles),"Inter-pole air")]:
+         c = int((mesh.tags == tag).sum())
+         if c: lines.append(f"  {name:<18}: {c:5d} elems")
+     pm_cnt = int(sum((mesh.tags == _pm_tag(p)).sum() for p in range(poles)))
+diff --git a/Bohemien_Motor_Designer/fea/py_runner.py b/Bohemien_Motor_Designer/fea/py_runner.py
+index 57f9991..65bcb09 100644
+--- a/Bohemien_Motor_Designer/fea/py_runner.py
++++ b/Bohemien_Motor_Designer/fea/py_runner.py
+@@ -42,12 +42,13 @@ class PythonFEARunner:
+     Parameters
+     ----------
+     motor            : PMSM instance
+-    n_radial_airgap  : radial elements across air gap (4 recommended)
+-    n_ang_per_slot   : angular elements per slot pitch (12 recommended)
++    n_radial_airgap  : radial elements across air gap.  THE main convergence
++                       knob: 4 → Ke ≈ 0.8×, 8 → Ke within 0.1 % (reference motor)
++    n_ang_per_slot   : angular elements per slot pitch (8–16)
+     """
+ 
+     def __init__(self, motor,
+-                 n_radial_airgap:   int = 4,
++                 n_radial_airgap:   int = 8,
+                  n_ang_per_slot:    int = 12):
+         self.motor  = motor
+         self._nr    = n_radial_airgap
+@@ -414,33 +415,76 @@ class PythonFEARunner:
+         if progress_cb:
+             progress_cb("Extracting Ld/Lq (2 perturbation solves at calibrated d-axis)...", 0.85)
+ 
+-        dI = max(abs(Iq) * 0.05, 1.0)
+-        # Perturbation at θ_m=0, θ_e = -theta_w  (d-axis aligned)
++# ── Ld/Lq: zero-background perturbation ──────────────────────────────────
++        # Use Id=Iq=0 baseline (no-load) so there is no large background
++        # current whose Park projection error can contaminate the tiny
++        # delta_psi signal. The no-load psi_d0 = Ke_fea (already computed).
++        #
++        # dI is fixed at a value that gives a flux change well above
++        # numerical noise (~0.001 mWb) but small enough to stay in the
++        # linear regime (<<< rated current).
++        # delta_psi = Ld * dI; need dI > noise/Ld ~ 0.001mWb / 0.05mH = 20A
++        # Use 20 A fixed — well below rated current for any motor in this range.
++        dI = 20.0   # A — fixed perturbation, linear regime, above noise floor
++
+         theta_m_pert = 0.0
+-        theta_e_pert = theta_m_pert * pp - theta_w
++        theta_e_pert = theta_m_pert * pp - theta_w  # d-axis aligned
+ 
+-        def _psi_at(Id_, Iq_):
++        def _psi_at_zero_bg(Id_, Iq_):
++            """Flux linkage with zero background current."""
+             Az = solve_magnetostatic(self._mesh, motor,
+                                      rotor_angle=theta_m_pert, Id=Id_, Iq=Iq_,
+                                      electrical_angle=theta_e_pert)
+             return compute_flux_linkage(self._mesh, Az, motor)
+ 
+-        p0  = _psi_at(Id,    Iq)
+-        p_d = _psi_at(Id+dI, Iq)
+-        p_q = _psi_at(Id,    Iq+dI)
++        # Baseline: reuse no-load psi_d = Ke_fea (saves one solve)
++        pd0 = Ke_fea   # psi_d at no-load, d-axis aligned
++        pq0 = 0.0      # psi_q = 0 at no-load in d-axis frame
++
++        p_d = _psi_at_zero_bg(dI,  0.0)   # d-axis perturbation only
++        p_q = _psi_at_zero_bg(0.0, dI)    # q-axis perturbation only
+ 
+-        pd0, pq0 = _park(p0,  theta_e_pert)
+-        pdd, _   = _park(p_d, theta_e_pert)
+-        _,  pqq  = _park(p_q, theta_e_pert)
++        pdd, _  = _park(p_d, theta_e_pert)
++        _,  pqq = _park(p_q, theta_e_pert)
+ 
+         Ld = (pdd - pd0) / dI
+         Lq = (pqq - pq0) / dI
+ 
++        # Clamp: inductance must be positive and physically bounded
++        Ld = max(Ld, 1e-7)
++        Lq = max(Lq, 1e-7)
++
++        # ── Step 5: mesh-convergence check ──────────────────────────────────
++        # Re-solve Ld on a mesh with half the angular density AND half the
++        # radial airgap layers.  The FEM energy converges from below, so
++        # Ld(fine)/Ld(coarse) > 1; if it exceeds ~1.10 the fine mesh is
++        # itself still far from converged and the Ld/Lq numbers should be
++        # treated as lower bounds.  (On the reference motor the radial
++        # airgap layers are the controlling parameter: n_radial_airgap=8
++        # brings Ke to 0.1 % and Ld to ~1 % of the converged value.)
++        if progress_cb:
++            progress_cb("Mesh-convergence check (coarser mesh, 2 solves)...", 0.95)
++        conv = self._convergence_check(Ld, theta_w, dI)
++
++        # ── Step 6: end-winding correction ──────────────────────────────────
++        # A 2D model cannot see end-winding leakage.  Add the analytical
++        # L_ew (PMSM.end_winding_leakage_inductance, Pyrhönen/Richter) to
++        # give the total synchronous inductance.  The analytical
++        # decomposition is reported alongside for a like-for-like comparison:
++        #   Ld_fem        ↔  L_2d_anal   (= L_ag + L_h + L_slot + L_tt)
++        #   Ld_fem + L_ew ↔  L_total_anal
++        try:
++            brk  = motor.inductance_breakdown()
++            L_ew = float(brk["L_ew"])
++        except Exception:
++            brk, L_ew = {}, 0.0
++
+         elapsed = time.time() - t0
+         if progress_cb:
+             progress_cb(
+                 f"Loaded done: T_avg={T_avg:.1f}Nm  Ke={Ke_fea:.4f}Wb  "
+-                f"Ld={Ld*1e3:.2f}mH Lq={Lq*1e3:.2f}mH  "
++                f"Ld={Ld*1e3:.4f}mH Lq={Lq*1e3:.4f}mH  (+L_ew {L_ew*1e3:.4f})  "
++                f"conv={conv['ratio']:.3f}{' ⚠' if not conv['converged'] else ''}  "
+                 f"THD={emf_thd_pct:.1f}%  [{elapsed:.0f}s]", 1.0)
+ 
+         result = dict(
+@@ -467,16 +511,79 @@ class PythonFEARunner:
+             Ke_Wb          = Ke_fea,
+             Ke_fem_Wb      = Ke_fem,
+             theta_w_deg    = float(np.degrees(theta_w)),
++            # Raw 2D FEM inductances (no end-winding leakage by construction)
+             Ld_H           = float(Ld),
+             Lq_H           = float(Lq),
+             Ld_mH          = float(Ld * 1e3),
+             Lq_mH          = float(Lq * 1e3),
++            # End-winding correction and totals
++            L_ew_mH        = L_ew * 1e3,
++            Ld_total_mH    = float((Ld + L_ew) * 1e3),
++            Lq_total_mH    = float((Lq + L_ew) * 1e3),
++            # Analytical decomposition for like-for-like comparison
++            L_2d_anal_mH   = float(brk.get("L_2d", 0.0) * 1e3),
++            L_total_anal_mH= float(brk.get("L_total", 0.0) * 1e3),
++            L_ag_anal_mH   = float(brk.get("L_ag", 0.0) * 1e3),
++            L_slot_anal_mH = float((brk.get("L_slot", 0.0) + brk.get("L_tt", 0.0)
++                                    + brk.get("L_h", 0.0)) * 1e3),
++            # Mesh convergence
++            conv_ratio     = conv["ratio"],
++            conv_converged = conv["converged"],
++            conv_coarse_Ld_mH = conv["Ld_coarse_mH"],
++            conv_mesh_fine = conv["mesh_fine"],
++            conv_mesh_coarse = conv["mesh_coarse"],
+             solve_time_s   = float(elapsed),
+             method         = "python_fem",
+         )
+         self._last_loaded = result
+         return result
+ 
++    # ── Mesh-convergence check ──────────────────────────────────────────────
++
++    def _convergence_check(self, Ld_fine: float, theta_w: float,
++                           dI: float, tol: float = 1.10) -> dict:
++        """
++        Re-extract Ld on a coarser mesh (half angular density, half radial
++        airgap layers) and return the ratio Ld_fine / Ld_coarse.
++
++        FEM energy converges from below, so the ratio is ≥ 1.  A ratio
++        above `tol` (default 1.10) means the fine mesh is still changing
++        by more than ~10 % per refinement step and the reported Ld/Lq are
++        lower bounds; increase n_radial_airgap first, then n_ang_per_slot.
++        """
++        from Bohemien_Motor_Designer.fea.py_solver import solve_magnetostatic
++        motor = self.motor
++        n_ang_c = max(2, self._na // 2)
++        n_ag_c  = max(2, self._nr // 2)
++        try:
++            mesh_c = build_motor_mesh(motor, n_radial_airgap=n_ag_c,
++                                      n_angular_per_slot=n_ang_c)
++            th_e = -theta_w
++            Az0 = solve_magnetostatic(mesh_c, motor, rotor_angle=0.0,
++                                      Id=0.0, Iq=0.0, electrical_angle=0.0)
++            p0  = compute_flux_linkage(mesh_c, Az0, motor)
++            c   = 2.0 / 3.0
++            pd0 = c * (p0["psi_A"]*np.cos(0.0) + p0["psi_B"]*np.cos(-2*np.pi/3)
++                       + p0["psi_C"]*np.cos(2*np.pi/3))
++            pq0 = c * (-p0["psi_B"]*np.sin(-2*np.pi/3) - p0["psi_C"]*np.sin(2*np.pi/3))
++            Ke_c = float(np.hypot(pd0, pq0))
++            Az_d = solve_magnetostatic(mesh_c, motor, rotor_angle=0.0,
++                                       Id=dI, Iq=0.0, electrical_angle=th_e)
++            p_d  = compute_flux_linkage(mesh_c, Az_d, motor)
++            pdd  = c * (p_d["psi_A"]*np.cos(th_e) + p_d["psi_B"]*np.cos(th_e-2*np.pi/3)
++                        + p_d["psi_C"]*np.cos(th_e+2*np.pi/3))
++            Ld_c = max((pdd - Ke_c) / dI, 1e-9)
++            ratio = float(Ld_fine / Ld_c)
++            return dict(ratio=ratio, converged=bool(ratio <= tol),
++                        Ld_coarse_mH=float(Ld_c * 1e3),
++                        mesh_fine=f"{self._na} ang/slot, {self._nr} AG layers",
++                        mesh_coarse=f"{n_ang_c} ang/slot, {n_ag_c} AG layers")
++        except Exception as exc:  # never let the check break the main result
++            return dict(ratio=float("nan"), converged=False,
++                        Ld_coarse_mH=float("nan"),
++                        mesh_fine=f"{self._na} ang/slot, {self._nr} AG layers",
++                        mesh_coarse=f"check failed: {exc}")
++
+ 
+     def summary(self) -> str:
+         m = self.motor
+@@ -502,8 +609,18 @@ class PythonFEARunner:
+             lines.append(f"FEA Torque ripple   = {r['T_ripple_pct']:.1f}%")
+             lines.append(f"FEA Ke              = {r['Ke_Wb']:.4f} Wb  "
+                          f"(err {Ke_err:.1f}% vs analytical)")
+-            lines.append(f"FEA Ld              = {r['Ld_mH']:.3f} mH")
+-            lines.append(f"FEA Lq              = {r['Lq_mH']:.3f} mH")
++            lines.append("— Inductance (2D FEM has no end-winding term) —")
++            lines.append(f"FEA Ld (2D raw)     = {r['Ld_mH']:.4f} mH   "
++                         f"analytical L_2d = {r.get('L_2d_anal_mH', 0):.4f} mH")
++            lines.append(f"FEA Lq (2D raw)     = {r['Lq_mH']:.4f} mH")
++            lines.append(f"+ L_ew (analytical) = {r.get('L_ew_mH', 0):.4f} mH")
++            lines.append(f"Ld total            = {r.get('Ld_total_mH', r['Ld_mH']):.4f} mH   "
++                         f"analytical L_total = {r.get('L_total_anal_mH', 0):.4f} mH")
++            lines.append(f"Lq total            = {r.get('Lq_total_mH', r['Lq_mH']):.4f} mH")
++            if 'conv_ratio' in r:
++                flag = "ok" if r['conv_converged'] else "NOT converged — refine mesh"
++                lines.append(f"Mesh convergence    = {r['conv_ratio']:.3f}  "
++                             f"[{r['conv_mesh_fine']} vs {r['conv_mesh_coarse']}]  {flag}")
+             lines.append(f"FEA BEMF fund       = {r['emf_fund_V']:.1f} V pk")
+             lines.append(f"FEA BEMF THD        = {r['emf_thd_pct']:.1f}%")
+             lines.append(f"Solve time          = {r['solve_time_s']:.0f}s")
+diff --git a/Bohemien_Motor_Designer/fea/py_solver.py b/Bohemien_Motor_Designer/fea/py_solver.py
+index b2010c9..294608d 100644
+--- a/Bohemien_Motor_Designer/fea/py_solver.py
++++ b/Bohemien_Motor_Designer/fea/py_solver.py
+@@ -225,11 +225,15 @@ def _build_J_winding(mesh, motor, Id, Iq, electrical_angle):
+ 
+     sp     = motor.stator.slot_profile if motor.stator else None
+     A_slot = sp.area() if sp else 1e-4
+-    ff     = getattr(motor, "slot_fill_factor", 0.45)
+     N_coil = getattr(motor, "turns_per_coil", 10)
+     n_lay  = motor.winding.layers if motor.winding else 2
+     A_coil = A_slot / n_lay
+-    J_scale = N_coil / (A_coil * ff + 1e-12)
++    # J is applied uniformly over the WHOLE meshed slot-layer area (copper +
++    # insulation + air), so the ampere-turns it must carry are N_coil·I and
++    # J = N_coil·I / A_layer.  Dividing by the fill factor here would inject
++    # N_coil·I/ff ampere-turns (≈2× too many at ff≈0.48).  ff only matters
++    # for the copper current density used in loss/thermal calculations.
++    J_scale = N_coil / (A_coil + 1e-12)
+ 
+     for coil in mesh.coil_data:
+         J[coil["elem_idx"]] = coil["direction"] * i_phase[coil["phase"]] * J_scale
+diff --git a/Bohemien_Motor_Designer/fea/runner3d.py b/Bohemien_Motor_Designer/fea/runner3d.py
+index 6615c5d..c6add9e 100644
+--- a/Bohemien_Motor_Designer/fea/runner3d.py
++++ b/Bohemien_Motor_Designer/fea/runner3d.py
+@@ -13,19 +13,35 @@ Usage
+     result = runner.run_static(progress_cb=print)
+     print(result['Ke_3d_Wb'], result['Ld_mH'], result['Lq_mH'])
+ 
+-Mesh-size guidance
+-------------------
+-  n_angular_per_slot=4, n_axial=4   →  ~75k DOF,  ~40s per solve,  Ke ~±25%
+-  n_angular_per_slot=4, n_axial=6   →  ~100k DOF, ~60s per solve,  Ke ~±20%
+-  n_angular_per_slot=6, n_axial=6   →  ~200k DOF, ~150s per solve, Ke ~±15%
+-  n_angular_per_slot=8, n_axial=8   →  ~500k DOF, ~600s per solve, Ke ~±8%
+-
+-Ke comparison to 2D
+--------------------
+-  The 3D solver captures end-winding flux leakage and axial fringing.
+-  At mid-stack the field matches the 2D solver within mesh discretisation error.
+-  Ke_3d is expected to be 5–20% below Ke_2d on typical PM motors because the
+-  3D B-field has axial components not present in the 2D cross-section model.
++What this solver is — and is not
++--------------------------------
++  By default (n_end_winding = 0) the 3D model is a pure axial extrusion
++  of the 2D cross-section with A_t = 0 on both stack faces.  It is a
++  genuinely 3D Nédélec edge-element solve and serves as an independent
++  check on the 2D solver: Ke_3d and Ld_3d must match Ke_2d and Ld_2d to
++  within mesh discretisation error (they do, on the reference motor).
++
++  It does NOT model the end turns, so it cannot see end-winding leakage.
++  L_ew is added analytically (PMSM.end_winding_leakage_inductance,
++  Pyrhönen/Richter) to both 2D and 3D results:   L_total = L_3d + L_ew.
++
++  n_end_winding > 0 enables an experimental 2.5-D model in which the
++  slot conductors are continued straight through an air end region to
++  the axial boundary.  That captures axial fringing but adds the
++  inductance of straight conductors in air, which is NOT end-turn
++  leakage; treat those numbers as indicative only.  Proper end-turn
++  geometry (circumferential arcs) is on the roadmap.
++
++  The d-axis inductance is cross-checked internally by the gauge-
++  invariant stored-energy method (result['Ld_energy_check'] ≈ 1.00).
++
++Mesh-size guidance (reference 8p/48s motor, pure extrusion)
++-----------------------------------------------------------
++  n_angular_per_slot=4, n_axial=2, n_radial_airgap=3  →   55k edges,  ~1 s/solve,  Ke ≈ 0.70×
++  n_angular_per_slot=4, n_axial=4, n_radial_airgap=4  →  ~130k edges,  ~10 s/solve
++  n_angular_per_slot=8, n_axial=4, n_radial_airgap=8  →  ~500k edges,  minutes/solve, Ke → 1.00×
++  Convergence is governed mainly by the radial airgap layers (as in 2D:
++  n_radial_airgap = 8 brings Ke to within 0.1 % of analytical).
+ """
+ from __future__ import annotations
+ import numpy as np
+@@ -41,17 +57,20 @@ class FEMRunner3D:
+     ----------
+     motor                : PMSM or SynRelMotor instance
+     n_angular_per_slot   : angular mesh density (4 = fast/coarse, 8 = accurate)
+-    n_axial              : axial layers in active stack (4–10)
+-    n_end_winding        : axial layers in each end-winding extension (1–3)
+-    n_radial_airgap      : radial layers across the airgap (2–6)
++    n_axial              : axial layers in active stack (2–8)
++    n_end_winding        : axial layers in each air end region.
++                           0 (default) = pure extrusion, validated against 2D.
++                           >0 = experimental straight-conductor end model.
++    n_radial_airgap      : radial layers across the airgap (3–8; this is the
++                           main convergence knob — 8 gives Ke within 0.1 %)
+     """
+ 
+     def __init__(self,
+                  motor,
+                  n_angular_per_slot: int = 4,
+-                 n_axial:            int = 6,
+-                 n_end_winding:      int = 2,
+-                 n_radial_airgap:    int = 3):
++                 n_axial:            int = 4,
++                 n_end_winding:      int = 0,
++                 n_radial_airgap:    int = 4):
+         self.motor              = motor
+         self.n_ang              = n_angular_per_slot
+         self.n_axial            = n_axial
+@@ -187,13 +206,11 @@ class FEMRunner3D:
+         # field weakening and saliency — this is the physically correct value.
+         _log("3D FEM: Ld/Lq perturbation (2 solves, zero-background)...", 0.50)
+ 
+-        # Choose dI to give ~5% of Ke as flux change: dI = 0.05*Ke / Ld_est
+-        # Use analytical Ld as the estimate to size dI appropriately.
+-        Ld_est = max(getattr(motor, 'Ld', 1e-4), 1e-5)
+-        dI     = max(0.05 * Ke_3d / Ld_est, 1.0)
+-        # Cap at rated current to avoid nonlinear saturation
+-        I_rated_est = motor.rated_power / (3 * 200 + 1)  # rough peak current
+-        dI = min(dI, I_rated_est)
++        # Fixed dI = 20 A: small enough for linear regime (<<< rated current),
++        # large enough that delta_psi = Ld * dI ~ 0.5 mWb >> mesh noise.
++        # Do NOT derive dI from Ke or Iq — that causes saturation or
++        # Park-projection contamination from large background currents.
++        dI = 20.0   # A — fixed, linear, above noise floor
+         th_e_pert = rotor_angle * pp - theta_w   # d-axis aligned frame
+ 
+         def _psi_dq_zero(Id_, Iq_):
+@@ -217,35 +234,78 @@ class FEMRunner3D:
+         pd0 = Ke_3d   # aligned d-axis, no current → psi_d = Ke
+         pq0 = 0.0     # no q-axis flux at no load in aligned frame
+ 
+-        pd_d, _  = _psi_dq_zero(dI,  0.0)   # d-axis perturbation
+-        _,  pq_q = _psi_dq_zero(0.0, dI)    # q-axis perturbation
+-
+-        Ld = (pd_d - pd0) / dI
++        # d-axis perturbation.  Also compute Ld by the stored-energy method
++        # (L = 4W/3I²), which is gauge-invariant and independent of the
++        # flux-linkage bookkeeping: the two must agree to ~0.1 %.
++        from Bohemien_Motor_Designer.fea.solver3d import _build_nu
++        _Br_backup = getattr(motor, "_get_Br", None)
++        motor._get_Br = lambda: 0.0                    # PM off for energy check
++        A_d = solve_magnetostatic_3d(self._mesh, motor, rotor_angle=rotor_angle,
++                                     Id=dI, Iq=0.0, electrical_angle=th_e_pert)
++        if _Br_backup is None:
++            del motor._get_Br
++        else:
++            motor._get_Br = _Br_backup
++        p_d = compute_flux_linkage_3d(self._mesh, A_d, motor, self._geom)
++        c_  = 2.0 / 3.0
++        pd_d = c_ * (p_d['psi_A']*np.cos(th_e_pert)
++                     + p_d['psi_B']*np.cos(th_e_pert-2*np.pi/3)
++                     + p_d['psi_C']*np.cos(th_e_pert+2*np.pi/3))
++        B_d  = compute_B_field_3d(self._mesh, A_d, self._geom)
++        nu   = _build_nu(self._mesh, motor)
++        W_d  = 0.5 * float(np.sum(nu * (B_d**2).sum(axis=1) * np.abs(self._geom["vol"])))
++        Ld_energy = 4.0 * W_d / (3.0 * dI**2)
++        Ld        = pd_d / dI                           # PM off → no baseline needed
++
++        # q-axis perturbation (PM on, baseline pq0 = 0 in aligned frame)
++        _, pq_q = _psi_dq_zero(0.0, dI)
+         Lq = (pq_q - pq0) / dI
+ 
+-        # Clamp to physically sensible range (avoids sign flips from noise)
+         Ld = max(Ld, 1e-6)
+         Lq = max(Lq, 1e-6)
++        energy_check = Ld / (Ld_energy + 1e-30)
++
++        # ── Step 4: reconcile with 2D and analytical ──────────────────────
++        # This 3D model is a pure axial extrusion of the 2D cross-section
++        # (plus, if n_end_winding > 0, straight conductors in an air end
++        # region — an experimental 2.5-D model, NOT end-turn geometry).
++        # It therefore cannot see end-winding leakage; L_ew is added
++        # analytically, exactly as for the 2D result.  See PMSM.
++        # end_winding_leakage_inductance() for the model and literature.
++        L_ew  = float(motor.end_winding_leakage_inductance())
++        brk   = motor.inductance_breakdown()
+ 
+         dt_total = time.time() - t0_total
+         _log(
+-            f"3D static done: Ke={Ke_3d:.4f}Wb  Ld={Ld*1e3:.2f}mH  Lq={Lq*1e3:.2f}mH  "
+-            f"[{dt_total:.0f}s]",
++            f"3D static done: Ke={Ke_3d:.4f}Wb  Ld={Ld*1e3:.4f}mH  Lq={Lq*1e3:.4f}mH  "
++            f"(energy check {energy_check:.3f})  +L_ew={L_ew*1e3:.4f}mH  [{dt_total:.0f}s]",
+             1.0,
+         )
+ 
+         result = dict(
+             # Ke
++            Ke_3d        = Ke_3d,
+             Ke_3d_Wb     = Ke_3d,
+             Ke_anal_Wb   = float(motor.back_emf_constant()),
+             theta_w_deg  = float(np.degrees(theta_w)),
+-            # Inductances
++            # Inductances — raw 3D (extrusion: no end-winding leakage)
+             Ld_H         = float(Ld),
+             Lq_H         = float(Lq),
+             Ld_mH        = float(Ld * 1e3),
+             Lq_mH        = float(Lq * 1e3),
++            Ld_energy_mH = float(Ld_energy * 1e3),
++            Ld_energy_check = float(energy_check),      # Ld_fluxlink / Ld_energy, expect 1.00
++            # End-winding correction and totals
++            L_ew_mH      = L_ew * 1e3,
++            Ld_total_mH  = float((Ld + L_ew) * 1e3),
++            Lq_total_mH  = float((Lq + L_ew) * 1e3),
++            # Analytical comparison (same decomposition)
++            L_2d_anal_mH    = brk["L_2d"] * 1e3,
++            L_total_anal_mH = brk["L_total"] * 1e3,
+             Ld_anal_mH   = float(motor.Ld * 1e3),
+             Lq_anal_mH   = float(motor.Lq * 1e3),
++            end_region_model = ("straight-conductor (experimental)"
++                                if self.n_ew > 0 else "none (pure extrusion)"),
+             # B-field
+             B_gap_mean_T = B_gap,
+             B_gap_max_T  = B_gap_max,
+diff --git a/Bohemien_Motor_Designer/fea/solver3d.py b/Bohemien_Motor_Designer/fea/solver3d.py
+index 1df2740..789c0fb 100644
+--- a/Bohemien_Motor_Designer/fea/solver3d.py
++++ b/Bohemien_Motor_Designer/fea/solver3d.py
+@@ -309,20 +309,26 @@ def _build_J_source(mesh, motor, geom, Id, Iq, electrical_angle) -> np.ndarray:
+     st      = motor.stator
+     sp      = st.slot_profile if st else None
+     A_slot  = sp.area() if sp else 1e-4
+-    ff      = getattr(motor, "slot_fill_factor", 0.45)
+     N_coil  = getattr(motor, "turns_per_coil", 2)
+     n_lay   = motor.winding.layers if motor.winding else 2
+     A_layer = A_slot / n_lay
+-    J_scale = N_coil / (A_layer * ff + 1e-15)
++    # No fill factor here: J is applied over the whole meshed slot-layer
++    # cross-section, so J = N_coil·I / A_layer carries exactly N_coil·I
++    # ampere-turns.  (Same reasoning as py_solver._build_J_winding.)
++    J_scale = N_coil / (A_layer + 1e-15)
+ 
+     vol      = geom["vol"]
+     grad_lam = geom["grad_lam"]
+ 
+-    # For each winding coil region:
++    # For each winding coil region.  The SOURCE uses the extended element
++    # list (stack + straight axial continuation to the z boundary) so that
++    # div J = 0 inside the domain.  Flux linkage (compute_flux_linkage_3d)
++    # deliberately uses only the in-stack elements — see the end-region
++    # modelling note in mesh3d.py.
+     for coil in mesh.coil_data:
+         phase     = coil["phase"]
+         direction = coil["direction"]
+-        idx       = coil["elem_idx"]   # tet indices in this slot+layer
++        idx       = coil.get("elem_idx_ext", coil["elem_idx"])
+         if len(idx) == 0:
+             continue
+ 
+@@ -415,34 +421,85 @@ def _apply_boundary_conditions(K: csr_matrix, f: np.ndarray, mesh) -> tuple:
+ 
+ def _spanning_tree_edges(mesh) -> set:
+     """
+-    BFS spanning tree of the node graph.
+-    Returns the set of global edge indices that form the spanning tree.
+-    These edges are pinned to zero for the Coulomb gauge.
++    Boundary-first BFS spanning tree of the node graph for the tree-cotree
++    gauge.  Returns the set of global edge indices pinned to zero.
++
++    Why boundary-first
++    ------------------
++    Tree edges are pinned to zero (gauge) and so are ALL edges on the
++    Dirichlet boundary (A_t = 0).  If the tree is grown from an arbitrary
++    node, it can contain an *interior* path between two boundary nodes;
++    together with a boundary path that forms a closed loop whose every
++    edge is pinned, i.e. a spurious "zero flux through this interior
++    surface" constraint.  With Dirichlet faces at both ends of the stack
++    these loops thread the whole machine and the field collapses.
++
++    Growing the tree over the boundary graph first (boundary edges only)
++    and only then into the interior guarantees that any cycle in
++    (tree ∪ boundary edges) lies entirely on the boundary, so the only
++    constraints enforced are the intended B_n = 0 on the boundary.
++    (Manges & Cendes, IEEE Trans. Magn. 1995; Albanese & Rubinacci.)
+     """
+     N      = mesh.n_nodes
+     edges  = mesh.edges   # (M, 2)
+ 
+-    # Build adjacency list: node → [(neighbour, edge_idx)]
++    bnd_edge = np.zeros(len(edges), dtype=bool)
++    bnd_edge[mesh.outer_edges] = True
++    bnd_node = np.zeros(N, dtype=bool)
++    bnd_node[mesh.outer_nodes] = True
++
++    # Adjacency: node → [(neighbour, edge_idx, is_boundary_edge)]
+     adj = [[] for _ in range(N)]
+     for ei, (a, b) in enumerate(edges):
+-        adj[a].append((b, ei))
+-        adj[b].append((a, ei))
++        be = bool(bnd_edge[ei])
++        adj[a].append((b, ei, be))
++        adj[b].append((a, ei, be))
+ 
+     visited    = np.zeros(N, dtype=bool)
+     tree_edges = set()
+ 
+-    # BFS from node 0
+-    queue = [0]
+-    visited[0] = True
++    def _bfs(seeds, boundary_only):
++        queue = [s for s in seeds if not visited[s]]
++        for s in queue:
++            visited[s] = True
++        while queue:
++            nxt = []
++            for node in queue:
++                for nb, ei, be in adj[node]:
++                    if boundary_only and not be:
++                        continue
++                    if not visited[nb]:
++                        visited[nb] = True
++                        tree_edges.add(ei)
++                        nxt.append(nb)
++            queue = nxt
++
++    # Phase 1: span every boundary component using boundary edges only.
++    bnd_list = np.where(bnd_node)[0]
++    for s in bnd_list:
++        if not visited[s]:
++            _bfs([int(s)], boundary_only=True)
++
++    # Phase 2: grow into the interior from the whole boundary (or from
++    # node 0 if there is no Dirichlet boundary at all).
++    seeds = [int(s) for s in bnd_list] if len(bnd_list) else [0]
++    # Re-seed BFS from all visited boundary nodes
++    queue = seeds
+     while queue:
+-        next_queue = []
++        nxt = []
+         for node in queue:
+-            for nb, ei in adj[node]:
++            for nb, ei, be in adj[node]:
+                 if not visited[nb]:
+                     visited[nb] = True
+                     tree_edges.add(ei)
+-                    next_queue.append(nb)
+-        queue = next_queue
++                    nxt.append(nb)
++        queue = nxt
++
++    # Any node still unvisited belongs to a disconnected component
++    # (should not happen for a motor mesh) — span it from itself.
++    for s in np.where(~visited)[0]:
++        if not visited[s]:
++            _bfs([int(s)], boundary_only=False)
+ 
+     return tree_edges
+ 
+@@ -538,10 +595,22 @@ def compute_flux_linkage_3d(mesh, A_edge: np.ndarray, motor, geom: dict) -> dict
+     """
+     Per-phase flux linkage [Wb] via coil volume integral.
+ 
+-        ψ_k = N_coil * (1/A_layer) ∫_coil A · ẑ dV
+-
+-    A · ẑ is the z-component of the vector potential, extracted from
+-    edge DOFs at element centroids.
++        ψ_k = N_coil · (1/A_layer) · ∫_coil A · ẑ dV            [Wb]
++
++    (A·ẑ in Wb/m, dV in m³, A_layer in m² → Wb.  There is NO division by
++    the stack length; an earlier version had one and returned Wb/m.)
++
++    Gauge invariance — why the integral runs over the FULL conductor
++    -----------------------------------------------------------------
++    ∫A·dl is gauge-invariant only around a closed loop.  The tree-cotree
++    gauge adds an arbitrary gradient ∇φ to A, and ∫∇φ·dl ≠ 0 over an open
++    segment, so integrating A_z over the in-stack part of a conductor
++    alone gives a gauge-polluted number.  The slot conductors are
++    continued straight to the axial Dirichlet faces (see mesh3d.py), where
++    A_t = 0 closes the loop at zero cost; the loop integral is therefore
++    the A_z integral over the *extended* conductor (coil["elem_idx_ext"]).
++    Verified against the gauge-invariant stored-energy method
++    (L = 4W/3I²) to four significant figures on the reference motor.
+     """
+     psi = np.zeros(3, dtype=np.float64)
+     vol     = geom["vol"]
+@@ -570,17 +639,12 @@ def compute_flux_linkage_3d(mesh, A_edge: np.ndarray, motor, geom: dict) -> dict
+     for coil in mesh.coil_data:
+         phase     = coil["phase"]
+         direction = coil["direction"]
+-        idx       = coil["elem_idx"]
++        idx       = coil.get("elem_idx_ext", coil["elem_idx"])
+         if len(idx) == 0:
+             continue
+-
+-        Az_c   = A_z_cent[idx]
+-        e_area = vol[idx]
+-        # Correct formula: psi = N * (1/A_layer) * (1/L) * integral(A_z dV)
+-        # = N * sum(A_z_cent * dV) / (A_layer * L_stack)
+-        dpsi   = (N_coil * direction
+-                  * np.sum(Az_c * e_area)
+-                  / (A_layer * motor.stack_length + 1e-15))
++        dpsi = (N_coil * direction
++                * np.sum(A_z_cent[idx] * np.abs(vol[idx]))
++                / (A_layer + 1e-15))
+         psi[phase] += dpsi
+ 
+     return {"psi_A": float(psi[0]), "psi_B": float(psi[1]), "psi_C": float(psi[2])}
+diff --git a/Bohemien_Motor_Designer/gui/app.py b/Bohemien_Motor_Designer/gui/app.py
+index c2c2ea5..f8b5fe0 100644
+--- a/Bohemien_Motor_Designer/gui/app.py
++++ b/Bohemien_Motor_Designer/gui/app.py
+@@ -323,6 +323,11 @@ def main():
+             nb.add(t11, text="  3D FEM  ")
+             self._build_3dfem_tab(t11)
+ 
++            # Tab 12 — Flux Visualisation
++            t12 = tk.Frame(nb, bg=PANEL)
++            nb.add(t12, text="  Flux Viz  ")
++            self._build_flux_tab(t12)
++
+             self._notebook = nb
+ 
+         def _build_mfg_tab(self, parent):
+@@ -941,10 +946,22 @@ def main():
+                 h     = m.back_emf_harmonics(n_harmonics=15)
+                 b_gap_note = (f"B_gap={cog['B_gap_used']:.3f}T magnet-circuit"
+                               if cog.get("B_gap_used") else "")
++                try:
++                    brk = m.inductance_breakdown()
++                    brk_lines = [
++                        f"    L_ag {brk['L_ag']*1e3:.4f}  L_h {brk['L_h']*1e3:.4f}  "
++                        f"L_slot {brk['L_slot']*1e3:.4f}  L_tt {brk['L_tt']*1e3:.4f}  "
++                        f"L_ew {brk['L_ew']*1e3:.4f} mH",
++                        f"    L_2d (what 2D/3D FEM sees) {brk['L_2d']*1e3:.4f} mH   "
++                        f"L_ew fraction {brk['L_ew_fraction']*100:.1f} %",
++                    ]
++                except Exception:
++                    brk_lines = []
+                 lines = [
+                     "─── Analytical Results ───",
+-                    f"  Ld (analytical)  : {m.Ld*1000:.3f} mH",
+-                    f"  Lq (analytical)  : {m.Lq*1000:.3f} mH",
++                    f"  Ld (analytical)  : {m.Ld*1000:.4f} mH",
++                    f"  Lq (analytical)  : {m.Lq*1000:.4f} mH",
++                    *brk_lines,
+                     f"  Cogging Tpp      : {cog['Tcog_pp_Nm']:.3f} N·m  "
+                     f"({cog['Tcog_pp_pct']:.2f}% rated)  [{b_gap_note}]",
+                     f"  Cogging period   : {cog['cogging_period_deg']:.2f}°  "
+@@ -1051,6 +1068,7 @@ def main():
+                 m = self._results["motor"]
+                 runner = self._make_fea_runner(m)
+                 data   = runner.run_loaded(progress_cb=self._fea_log)
++                self._results["fea_loaded"] = data    # for the 3D tab's 2D-vs-3D lines
+                 self.after(0, lambda: self._fea_update_loaded(data))
+             except Exception as e:
+                 self._fea_log(f"ERROR: {e}")
+@@ -1068,21 +1086,23 @@ def main():
+               2. FEARunner (Elmer) -- used only if GMSH + Elmer are both on PATH
+ 
+             The Python runner is preferred because it needs no installation.
+-            The user can force Elmer by setting Bohemien_Motor_Designer_USE_ELMER=1 in
++            The user can force Elmer by setting MOTORDESIGN2_USE_ELMER=1 in
+             the environment.
+             """
+             import os, shutil
+-            use_elmer = os.environ.get("Bohemien_Motor_Designer_USE_ELMER", "0") == "1"
++            use_elmer = os.environ.get("MOTORDESIGN2_USE_ELMER", "0") == "1"
+ 
+             if use_elmer:
+                 from Bohemien_Motor_Designer.fea.runner import FEARunner
+-                self._fea_log("Using Elmer FEA pipeline (Bohemien_Motor_Designer_USE_ELMER=1)", 0.0)
++                self._fea_log("Using Elmer FEA pipeline (MOTORDESIGN2_USE_ELMER=1)", 0.0)
+                 return FEARunner(motor, work_dir=self._fea_workdir_var.get())
+ 
+             # Default: py_runner (validated numpy/scipy FEM, no external tools)
+             from Bohemien_Motor_Designer.fea.py_runner import PythonFEARunner as _PyRunner
+             self._fea_log("Using built-in Python FEM solver (numpy/scipy only)", 0.0)
+-            runner = _PyRunner(motor, n_radial_airgap=4, n_ang_per_slot=8)
++            # 8 airgap layers: the convergence study on the reference motor
++            # showed Ke 0.80× at 4 layers vs 1.00× at 8 (Ld +20 %).  Cost: ~7 s.
++            runner = _PyRunner(motor, n_radial_airgap=8, n_ang_per_slot=12)
+             runner.build_mesh()
+             self._fea_log("FEM mesh built — ready to solve.", 0.05)
+             return runner
+@@ -1132,11 +1152,27 @@ def main():
+                 f"  T_avg (FEA)  : {data.get('torque_avg_Nm', float('nan')):.2f} N·m",
+                 f"  T_rated      : {m.rated_torque:.2f} N·m",
+             ]
++            if data.get("Ke_Wb"):
++                ke_an = m.back_emf_constant()
++                lines.append(f"  Ke (FEA)     : {data['Ke_Wb']:.5f} Wb   analyt {ke_an:.5f}  "
++                             f"(ratio {data['Ke_Wb']/(ke_an+1e-12):.3f})")
+             if data.get("Ld_H"):
++                Ld = data['Ld_H']*1000; Lq = (data.get('Lq_H') or m.Lq)*1000
++                L_ew = data.get("L_ew_mH", 0.0)
+                 lines += [
+-                    f"  Ld (FEA)     : {data['Ld_H']*1000:.3f} mH",
+-                    f"  Lq (FEA)     : {(data.get('Lq_H') or m.Lq)*1000:.3f} mH",
++                    "  — Inductance: 2D FEM has no end-winding term —",
++                    f"  Ld 2D raw    : {Ld:.4f} mH   analyt L_2d  {data.get('L_2d_anal_mH', 0):.4f} mH",
++                    f"  Lq 2D raw    : {Lq:.4f} mH",
++                    f"  + L_ew       : {L_ew:.4f} mH  (analytical, ±30–50 %)",
++                    f"  Ld total     : {data.get('Ld_total_mH', Ld+L_ew):.4f} mH   "
++                    f"analyt L_tot {data.get('L_total_anal_mH', m.Ld*1000):.4f} mH",
++                    f"  Lq total     : {data.get('Lq_total_mH', Lq+L_ew):.4f} mH",
+                 ]
++                if "conv_ratio" in data:
++                    cr = data["conv_ratio"]
++                    flag = "ok" if data.get("conv_converged") else "NOT converged — raise AG layers"
++                    lines.append(f"  Mesh conv.   : {cr:.3f}  "
++                                 f"[{data.get('conv_mesh_fine','')} vs {data.get('conv_mesh_coarse','')}]  {flag}")
+             if data.get("emf_waveform") and data["emf_waveform"].get("thd_pct") is not None:
+                 lines.append(f"  EMF THD (FEA): {data['emf_waveform']['thd_pct']:.1f}%")
+ 
+@@ -1573,15 +1609,20 @@ def main():
+                            buttonbackground=PANEL, relief="flat"
+                            ).grid(row=0, column=col+1, sticky="w", padx=(0, 10))
+ 
+-            self._3d_nang  = tk.IntVar(value=4)
+-            self._3d_nax   = tk.IntVar(value=6)
+-            self._3d_nag   = tk.IntVar(value=3)
+-            self._3d_new   = tk.IntVar(value=2)
++            # Defaults chosen from the convergence study on the reference
++            # motor: AG layers is the dominant knob (8 → Ke within 1 %);
++            # 2 axial layers are enough for a pure extrusion; End-region 0
++            # = pure extrusion (validated against 2D).  End-region > 0 is
++            # the experimental straight-conductor model — see runner3d.py.
++            self._3d_nang  = tk.IntVar(value=8)
++            self._3d_nax   = tk.IntVar(value=2)
++            self._3d_nag   = tk.IntVar(value=8)
++            self._3d_new   = tk.IntVar(value=0)
+ 
+             _spin(ctrl, "Ang/slot:",  self._3d_nang, 4,  16, 2, 0)
+-            _spin(ctrl, "Axial:",     self._3d_nax,  4,  16, 2, 2)
+-            _spin(ctrl, "AG layers:", self._3d_nag,  2,   8, 1, 4)
+-            _spin(ctrl, "End-wind:",  self._3d_new,  1,   4, 1, 6)
++            _spin(ctrl, "Axial:",     self._3d_nax,  1,  16, 1, 2)
++            _spin(ctrl, "AG layers:", self._3d_nag,  2,  16, 2, 4)
++            _spin(ctrl, "End-region:", self._3d_new, 0,   4, 1, 6)
+ 
+             self._btn_3d = tk.Button(
+                 ctrl, text="\u25b6 Run 3D FEM",
+@@ -1719,44 +1760,489 @@ def main():
+             theta_w = r.get("theta_w_deg", 0)
+ 
+             ke_ratio = Ke_3d / Ke_an if Ke_an > 1e-9 else 0
++            L_ew     = r.get("L_ew_mH", 0)
++            Ld_tot   = r.get("Ld_total_mH", Ld_3d + L_ew)
++            Lq_tot   = r.get("Lq_total_mH", Lq_3d + L_ew)
++            L2d_an   = r.get("L_2d_anal_mH", 0)
++            Ltot_an  = r.get("L_total_anal_mH", Ld_an)
++            echk     = r.get("Ld_energy_check", float("nan"))
++            end_mdl  = r.get("end_region_model", "none (pure extrusion)")
++
++            # Pull the last 2D FEM result (if any) for a direct 2D-vs-3D line
++            r2d = (self._results or {}).get("fea_loaded") or {}
++            Ld_2d = r2d.get("Ld_mH"); Lq_2d = r2d.get("Lq_mH"); Ke_2d = r2d.get("Ke_Wb")
++
++            def _tag(x):
++                if x is None or not np.isfinite(x):
++                    return ""
++                return "\u2713" if 0.95 <= x <= 1.05 else ("~" if 0.85 <= x <= 1.15 else "\u26a0")
+ 
+             lines = [
+                 "\u2500\u2500\u2500 3D N\u00e9d\u00e9lec FEM Results \u2500\u2500\u2500",
+                 f"  Mesh:    {nodes:,} nodes  {tets:,} tets  {edges:,} edge DOFs",
+                 f"  Solve:   {dt:.0f}s total (mesh + 3 solves)",
++                f"  End region: {end_mdl}",
+                 "",
+-                "  — Flux Linkage (Ke) —",
++                "  \u2014 Flux Linkage (Ke) \u2014",
+                 f"  Ke 3D      : {Ke_3d:.5f} Wb",
+-                f"  Ke analyt  : {Ke_an:.5f} Wb",
+-                f"  Ratio      : {ke_ratio:.3f}  "
+-                f"({'↑ end-winding' if ke_ratio < 0.95 else 'converged'})",
++                f"  Ke analyt  : {Ke_an:.5f} Wb    ratio {ke_ratio:.3f} {_tag(ke_ratio)}",
++            ]
++            if Ke_2d:
++                lines.append(f"  Ke 2D FEM  : {Ke_2d:.5f} Wb    3D/2D {Ke_3d/Ke_2d:.3f} {_tag(Ke_3d/Ke_2d)}")
++            lines += [
+                 f"  \u03b8_w offset : {theta_w:.1f}\u00b0 electrical",
+                 "",
+-                "  — Inductances (Park perturbation) —",
+-                f"  Ld 3D      : {Ld_3d:.3f} mH    analyt: {Ld_an:.3f} mH",
+-                f"  Lq 3D      : {Lq_3d:.3f} mH    analyt: {Lq_an:.3f} mH",
+-                f"  Lq/Ld 3D   : {Lq_3d/(Ld_3d+1e-9):.3f}  "
+-                f"(analyt: {Lq_an/(Ld_an+1e-9):.3f})",
++                "  \u2014 Inductances \u2014",
++                "  (3D extrusion sees the same leakage as 2D: slot, tooth-tip,",
++                "   harmonic.  End-winding L_ew is analytical, added to both.)",
++                f"  Ld 3D raw  : {Ld_3d:.4f} mH    analyt L_2d : {L2d_an:.4f} mH",
++                f"  Lq 3D raw  : {Lq_3d:.4f} mH",
++            ]
++            if Ld_2d:
++                lines.append(f"  Ld 2D raw  : {Ld_2d:.4f} mH    3D/2D {Ld_3d/Ld_2d:.3f} {_tag(Ld_3d/Ld_2d)}")
++            if Lq_2d:
++                lines.append(f"  Lq 2D raw  : {Lq_2d:.4f} mH    3D/2D {Lq_3d/Lq_2d:.3f} {_tag(Lq_3d/Lq_2d)}")
++            lines += [
++                f"  + L_ew     : {L_ew:.4f} mH   (Richter/Pyrh\u00f6nen, \u00b130\u201350 %)",
++                f"  Ld total   : {Ld_tot:.4f} mH    analyt L_tot: {Ltot_an:.4f} mH",
++                f"  Lq total   : {Lq_tot:.4f} mH",
++                f"  Lq/Ld 3D   : {Lq_3d/(Ld_3d+1e-9):.3f}",
++                f"  Energy chk : {echk:.4f}  (flux-linkage / stored-energy Ld, expect 1.000)",
+                 "",
+-                "  — Airgap B-field (mid-stack) —",
++                "  \u2014 Airgap B-field (mid-stack) \u2014",
+                 f"  |B| mean   : {B_mean:.3f} T    analyt: {B_an:.3f} T",
+                 f"  |B| max    : {B_max:.3f} T",
+                 "",
+-                "  Tip: increase Ang/slot for better Ke accuracy.",
+-                "  End-winding effects reduce Ke vs 2D by 5-15%.",
++                "  Convergence: AG layers is the main knob (8 \u2192 Ke within ~1 %),",
++                "  then Ang/slot.  Axial layers barely matter for a pure extrusion.",
+             ]
+ 
+             self._set_text(self.txt_3d_results, "\n".join(lines))
+             self._3dfem_status.config(
+-                text=f"✔  3D FEM done  —  "
++                text=f"\u2714  3D FEM done  \u2014  "
+                      f"Ke={Ke_3d:.4f}Wb (ratio {ke_ratio:.2f})  "
+-                     f"Ld={Ld_3d:.2f}mH  Lq={Lq_3d:.2f}mH  "
++                     f"Ld={Ld_3d:.4f}+{L_ew:.4f}mH  Lq={Lq_3d:.4f}+{L_ew:.4f}mH  "
+                      f"[{dt:.0f}s]")
+ 
+ 
+ 
+ 
+ 
++
++        # ── Flux Visualisation tab ───────────────────────────────────────────────
++
++        def _build_flux_tab(self, parent):
++            """
++            Tab 12 — Magnetic Flux Visualisation (Phase 1).
++
++            Shows three matplotlib panels:
++              Left  : A_z contours (= exact flux lines, no interpolation needed)
++              Centre: |B| magnitude colour map on the triangular mesh
++              Right : Material region map with flux density legend
++
++            All data comes from the existing 2D magnetostatic solver — no new
++            solver code is required. The FEM solve takes 0.3–2s depending on mesh.
++            """
++
++            # ── Controls strip ────────────────────────────────────────────────
++            ctrl = tk.Frame(parent, bg=PANEL)
++            ctrl.pack(fill="x", padx=10, pady=(8, 4))
++
++            def _lbl(text, col):
++                tk.Label(ctrl, text=text, bg=PANEL, fg=TEXT_DIM,
++                         font=FONT_BODY).grid(row=0, column=col,
++                                              sticky="w", padx=(0, 3))
++
++            def _spin(var, lo, hi, step, col, w=5):
++                tk.Spinbox(ctrl, from_=lo, to=hi, increment=step,
++                           textvariable=var, width=w,
++                           bg=ENTRY_BG, fg=TEXT, font=FONT_BODY,
++                           buttonbackground=PANEL, relief="flat",
++                           ).grid(row=0, column=col, sticky="w", padx=(0, 10))
++
++            # Angular mesh density
++            _lbl("Ang/slot:", 0)
++            self._fv_nang = tk.IntVar(value=8)
++            _spin(self._fv_nang, 4, 32, 4, 1)
++
++            # Airgap radial layers
++            _lbl("AG layers:", 2)
++            self._fv_nag = tk.IntVar(value=4)
++            _spin(self._fv_nag, 2, 12, 1, 3)
++
++            # Rotor angle (electrical degrees)
++            _lbl("Rotor angle (°):", 4)
++            self._fv_angle = tk.DoubleVar(value=0.0)
++            _spin(self._fv_angle, 0, 360, 15, 5, w=6)
++
++            # Flux line count
++            _lbl("Flux lines:", 6)
++            self._fv_nlines = tk.IntVar(value=20)
++            _spin(self._fv_nlines, 8, 60, 4, 7)
++
++            # Colourmap selector
++            _lbl("B colourmap:", 8)
++            self._fv_cmap = tk.StringVar(value="plasma")
++            cmaps = ["plasma", "hot", "inferno", "magma", "viridis",
++                     "RdBu_r", "coolwarm"]
++            ttk.Combobox(ctrl, textvariable=self._fv_cmap, values=cmaps,
++                         width=10, state="readonly",
++                         ).grid(row=0, column=9, sticky="w", padx=(0, 10))
++
++            # Run button
++            self._btn_fv = tk.Button(
++                ctrl, text="▶ Run Flux Viz",
++                bg=ACCENT, fg="#ffffff", font=FONT_BODY,
++                relief="flat", cursor="hand2",
++                command=self._flux_run_async)
++            self._btn_fv.grid(row=0, column=10, sticky="ew", padx=(4, 6))
++
++            # Save button
++            self._btn_fv_save = tk.Button(
++                ctrl, text="💾 Save PNG",
++                bg=PANEL, fg=TEXT, font=FONT_BODY,
++                relief="flat", cursor="hand2",
++                command=self._flux_save)
++            self._btn_fv_save.grid(row=0, column=11, sticky="ew")
++
++            # Animate button
++            self._fv_animate = tk.BooleanVar(value=False)
++            tk.Checkbutton(ctrl, text="Animate rotation",
++                           variable=self._fv_animate,
++                           bg=PANEL, fg=TEXT, selectcolor=PANEL,
++                           activebackground=PANEL, font=FONT_BODY,
++                           ).grid(row=0, column=12, sticky="w", padx=(8, 0))
++
++            # Status bar
++            self._fv_status = tk.Label(
++                parent,
++                text="Run a design first, then click Run Flux Viz.",
++                bg=PANEL, fg=TEXT_DIM, font=FONT_BODY, anchor="w")
++            self._fv_status.pack(fill="x", padx=10, pady=(0, 2))
++
++            # Progress bar
++            self._fv_progress = ttk.Progressbar(parent, mode="indeterminate",
++                                                  length=200)
++            self._fv_progress.pack(fill="x", padx=10, pady=(0, 4))
++
++            # ── Figure: 3 panels ──────────────────────────────────────────────
++            self._fv_fig = Figure(figsize=(15, 6), facecolor="#0f1117")
++            self._fv_canvas = FigureCanvasTkAgg(self._fv_fig, master=parent)
++            self._fv_canvas.get_tk_widget().pack(fill="both", expand=True,
++                                                  padx=6, pady=(0, 4))
++            toolbar = NavigationToolbar2Tk(self._fv_canvas, parent,
++                                           pack_toolbar=False)
++            toolbar.configure(bg=BG)
++            toolbar.pack(side="bottom", fill="x")
++            self._fv_canvas.draw()
++
++            # State cache
++            self._fv_mesh  = None
++            self._fv_motor = None
++            self._fv_Az    = None
++            self._fv_animating = False
++
++        def _flux_run_async(self):
++            """Start the flux visualisation solve in a background thread."""
++            if not self._results or "motor" not in self._results:
++                self._fv_status.config(
++                    text="⚠  Run a design first (▶ RUN DESIGN).")
++                return
++            if self._fv_animating:
++                self._fv_animating = False
++                self._btn_fv.config(text="▶ Run Flux Viz")
++                return
++            self._btn_fv.config(state="disabled")
++            self._fv_progress.start(12)
++            self._fv_status.config(text="Building mesh and solving…")
++            t = threading.Thread(target=self._flux_worker, daemon=True)
++            t.start()
++
++        def _flux_worker(self):
++            """Background: mesh → solve → plot → update canvas."""
++            try:
++                motor  = self._results["motor"]
++                n_ang  = self._fv_nang.get()
++                n_ag   = self._fv_nag.get()
++                angle_deg = self._fv_angle.get()
++                rotor_angle_rad = float(angle_deg) * np.pi / 180.0
++
++                self.after(0, lambda: self._fv_status.config(
++                    text=f"Building mesh  (ang/slot={n_ang}, AG layers={n_ag})…"))
++
++                from Bohemien_Motor_Designer.fea.py_mesh import build_motor_mesh
++                mesh = build_motor_mesh(motor,
++                                        n_radial_airgap=n_ag,
++                                        n_angular_per_slot=n_ang)
++
++                self.after(0, lambda: self._fv_status.config(
++                    text=f"Mesh: {mesh.n_nodes:,} nodes  {mesh.n_elems:,} elements"
++                         f"  —  Solving magnetostatics…"))
++
++                from Bohemien_Motor_Designer.fea.py_solver import (
++                    solve_magnetostatic, compute_B_field)
++
++                A_z = solve_magnetostatic(mesh, motor,
++                                          rotor_angle=rotor_angle_rad,
++                                          Id=0.0, Iq=0.0,
++                                          electrical_angle=0.0)
++                Bx, By, B_mag = compute_B_field(mesh, A_z)
++
++                # Cache for animation and export
++                self._fv_mesh  = mesh
++                self._fv_motor = motor
++                self._fv_Az    = A_z
++
++                self.after(0, lambda: self._fv_status.config(
++                    text="Rendering flux visualisation…"))
++                self.after(0, lambda: self._flux_render(
++                    mesh, A_z, Bx, By, B_mag, motor, angle_deg))
++
++            except Exception as exc:
++                import traceback as _tb
++                msg = f"{exc}\n{_tb.format_exc()}"
++                self.after(0, lambda m=msg: self._fv_status.config(
++                    text=f"⚠  {exc}"))
++                self.after(0, lambda m=msg: print(m))
++            finally:
++                self.after(0, self._fv_progress.stop)
++                self.after(0, lambda: self._btn_fv.config(state="normal"))
++
++        def _flux_render(self, mesh, A_z, Bx, By, B_mag, motor, angle_deg):
++            """
++            Render three panels into self._fv_fig.
++            Called on the main thread via self.after().
++
++            Panel 1 — Flux lines:   tricontour of A_z
++                       A_z isolines ARE the flux lines in 2D magnetostatics
++                       (Bx = dAz/dy, By = -dAz/dx, so B is tangent to A_z isolines)
++                       No interpolation needed — direct from nodal values.
++
++            Panel 2 — |B| map:      tripcolor of B_mag with material boundaries
++
++            Panel 3 — B histogram + material legend
++            """
++            import matplotlib.pyplot as _plt
++            from matplotlib.colors import Normalize
++            from matplotlib.cm import ScalarMappable
++            import matplotlib.patches as mpatches
++            import matplotlib.tri as mtri
++
++            FIG_BG  = "#0f1117"
++            AX_BG   = "#0d1020"
++            GRID_C  = "#1e2240"
++            self._fv_fig.clf()
++
++            gs = self._fv_fig.add_gridspec(
++                1, 3, wspace=0.08,
++                left=0.04, right=0.98, top=0.93, bottom=0.08)
++
++            ax1 = self._fv_fig.add_subplot(gs[0])
++            ax2 = self._fv_fig.add_subplot(gs[1])
++            ax3 = self._fv_fig.add_subplot(gs[2])
++
++            for ax in (ax1, ax2, ax3):
++                ax.set_facecolor(AX_BG)
++                ax.tick_params(colors="#6070a0", labelsize=7)
++                for spine in ax.spines.values():
++                    spine.set_edgecolor(GRID_C)
++
++            nodes   = mesh.nodes
++            elems   = mesh.elems
++            tags    = mesh.tags
++            x_mm    = nodes[:, 0] * 1000   # metres → mm
++            y_mm    = nodes[:, 1] * 1000
++            n_lines = self._fv_nlines.get()
++            cmap    = self._fv_cmap.get()
++
++            # ── Triangulation (shared across panels) ─────────────────────────
++            triang  = mtri.Triangulation(x_mm, y_mm, elems)
++
++            # Centroid coords for element-based data
++            cx_mm   = x_mm[elems].mean(axis=1)
++            cy_mm   = y_mm[elems].mean(axis=1)
++
++            # ─────────────────────────────────────────────────────────────────
++            # Panel 1 — Flux lines (A_z contours)
++            # ─────────────────────────────────────────────────────────────────
++            ax1.set_title("Magnetic flux lines  (isolines of A_z)",
++                           color="#c0c8e8", fontsize=8, pad=6)
++
++            # Filled contours first for background colour gradient
++            ax1.tricontourf(triang, A_z, levels=60, cmap="RdBu_r", alpha=0.55)
++
++            # Flux lines — solid black contour lines of A_z
++            cs = ax1.tricontour(triang, A_z, levels=n_lines,
++                                colors="white", linewidths=0.5, alpha=0.85)
++
++            # Material boundaries — draw element edges coloured by region
++            REGION_COLORS = {
++                "stator_iron": "#4488cc",
++                "rotor_iron":  "#44aacc",
++                "magnet":      "#e87040",
++                "winding_A":   "#e84080",
++                "winding_B":   "#80e840",
++                "winding_C":   "#4080e8",
++                "airgap":      "#223355",
++            }
++            _drawn_regions = set()
++            if hasattr(mesh, "groups") and mesh.groups:
++                for region, elem_idx in mesh.groups.items():
++                    col = REGION_COLORS.get(
++                        region.split("_")[0] if "_" in region else region,
++                        "#556688")
++                    if len(elem_idx) == 0:
++                        continue
++                    # Draw a thin boundary triangle patch per element
++                    tri_r = mtri.Triangulation(x_mm, y_mm, elems[elem_idx])
++                    ax1.triplot(tri_r, color=col, linewidth=0.15, alpha=0.35)
++
++            ax1.set_xlabel("x  [mm]", color="#6070a0", fontsize=7)
++            ax1.set_ylabel("y  [mm]", color="#6070a0", fontsize=7)
++            ax1.set_aspect("equal")
++            ax1.grid(True, color=GRID_C, linewidth=0.3, alpha=0.5)
++
++            # ─────────────────────────────────────────────────────────────────
++            # Panel 2 — |B| magnitude map
++            # ─────────────────────────────────────────────────────────────────
++            ax2.set_title("|B| flux density map  [T]",
++                           color="#c0c8e8", fontsize=8, pad=6)
++
++            # B_mag is per element — use tripcolor
++            B_clip = np.clip(B_mag, 0, np.percentile(B_mag, 99))
++            tc = ax2.tripcolor(triang, B_clip, cmap=cmap, shading="gouraud",
++                               vmin=0, vmax=B_clip.max())
++
++            # Overlay A_z flux lines (fewer, thinner, semi-transparent)
++            ax2.tricontour(triang, A_z, levels=n_lines,
++                           colors="white", linewidths=0.4, alpha=0.55)
++
++            # Motor geometry outlines
++            motor_R_so = motor.stator.outer_radius * 1000
++            motor_R_si = motor.stator.inner_radius * 1000
++            motor_R_ro = motor.rotor_outer_radius  * 1000
++
++            for R, lw, ls in [(motor_R_so, 1.2, "-"),
++                               (motor_R_si, 0.8, "--"),
++                               (motor_R_ro, 0.8, "-.")]:
++                theta_ring = np.linspace(0, 2 * np.pi, 360)
++                ax2.plot(R * np.cos(theta_ring), R * np.sin(theta_ring),
++                         color="#88aadd", linewidth=lw, linestyle=ls,
++                         alpha=0.55)
++
++            # Colourbar
++            cb = self._fv_fig.colorbar(tc, ax=ax2, fraction=0.04, pad=0.02)
++            cb.ax.tick_params(colors="#6070a0", labelsize=7)
++            cb.set_label("Tesla", color="#6070a0", fontsize=7)
++
++            ax2.set_xlabel("x  [mm]", color="#6070a0", fontsize=7)
++            ax2.set_ylabel("y  [mm]", color="#6070a0", fontsize=7)
++            ax2.set_aspect("equal")
++
++            # ─────────────────────────────────────────────────────────────────
++            # Panel 3 — B magnitude histogram + region stats
++            # ─────────────────────────────────────────────────────────────────
++            ax3.set_title("B field distribution by region",
++                           color="#c0c8e8", fontsize=8, pad=6)
++
++            # Identify airgap elements by their tag
++            REGION_LABEL = {}
++            TAG_COLORS   = {}
++            if hasattr(mesh, "groups") and mesh.groups:
++                for name, eidx in mesh.groups.items():
++                    base = name.split("_")[0] if "_" in name else name
++                    col  = REGION_COLORS.get(base, "#556688")
++                    if len(eidx) > 0:
++                        B_r = B_mag[eidx]
++                        label = f"{name}  μ={B_r.mean():.3f}T"
++                        ax3.hist(B_r, bins=40, alpha=0.55, color=col,
++                                 label=label, density=True, histtype="stepfilled",
++                                 linewidth=0.6, edgecolor=col)
++            else:
++                # Fallback: whole-motor histogram
++                ax3.hist(B_mag, bins=60, alpha=0.7, color="#4f8ef7",
++                         density=True, histtype="stepfilled",
++                         edgecolor="#4f8ef7", linewidth=0.6,
++                         label=f"All elements  μ={B_mag.mean():.3f}T  "
++                               f"max={B_mag.max():.3f}T")
++
++            # Key reference lines
++            B_sat = 1.8   # typical silicon steel saturation
++            ax3.axvline(B_sat, color="#f7804f", linewidth=0.8,
++                        linestyle="--", alpha=0.8, label=f"Saturation ≈{B_sat}T")
++            ax3.axvline(B_mag.mean(), color="#4fcf82", linewidth=0.8,
++                        linestyle=":", label=f"Mean = {B_mag.mean():.3f}T")
++
++            ax3.set_xlabel("|B|  [T]", color="#6070a0", fontsize=7)
++            ax3.set_ylabel("Probability density", color="#6070a0", fontsize=7)
++            ax3.grid(True, color=GRID_C, linewidth=0.3, alpha=0.5)
++            ax3.legend(fontsize=6, loc="upper right",
++                       facecolor="#1a1d2e", edgecolor=GRID_C,
++                       labelcolor="#c0c8e8")
++
++            # ── Figure title ──────────────────────────────────────────────────
++            self._fv_fig.suptitle(
++                f"Magnetic Flux  —  {motor.poles}p/{motor.slots}s PMSM  "
++                f"|  Rotor angle = {angle_deg:.0f}°  "
++                f"|  B mean = {B_mag.mean():.3f} T   max = {B_mag.max():.3f} T",
++                color="#e8eaf6", fontsize=9)
++
++            self._fv_canvas.draw()
++
++            n_sat = int(np.sum(B_mag > B_sat))
++            pct_sat = 100.0 * n_sat / max(len(B_mag), 1)
++            self._fv_status.config(
++                text=f"✔  {mesh.n_nodes:,} nodes  |  B mean={B_mag.mean():.3f}T  "
++                     f"max={B_mag.max():.3f}T  |  "
++                     f"Saturated elements (>{B_sat}T): {n_sat} ({pct_sat:.1f}%)")
++
++            # Start animation if requested
++            if self._fv_animate.get():
++                self._fv_animating = True
++                self._btn_fv.config(text="■ Stop animation", state="normal")
++                self.after(50, self._flux_animate_step)
++
++        def _flux_animate_step(self):
++            """
++            Rotate the rotor by one step and re-solve.
++            Called repeatedly via self.after() until animation is stopped.
++            """
++            if not self._fv_animating or self._fv_motor is None:
++                self._fv_animating = False
++                self._btn_fv.config(text="▶ Run Flux Viz")
++                return
++
++            # Advance rotor angle by one step
++            current = self._fv_angle.get()
++            step    = 360.0 / (self._fv_motor.poles * 6)  # 1/6 electrical period
++            new_ang = (current + step) % 360.0
++            self._fv_angle.set(round(new_ang, 1))
++
++            # Solve in background thread
++            t = threading.Thread(target=self._flux_worker, daemon=True)
++            t.start()
++
++        def _flux_save(self):
++            """Save the current flux visualisation as PNG."""
++            if self._fv_motor is None:
++                self._fv_status.config(text="⚠  Run flux visualisation first.")
++                return
++            from tkinter.filedialog import asksaveasfilename
++            path = asksaveasfilename(
++                defaultextension=".png",
++                filetypes=[("PNG image", "*.png"),
++                           ("SVG vector", "*.svg"),
++                           ("PDF", "*.pdf"),
++                           ("All files", "*.*")],
++                initialfile="flux_visualisation.png",
++                title="Save flux visualisation")
++            if path:
++                self._fv_fig.savefig(path, dpi=250,
++                                     bbox_inches="tight",
++                                     facecolor="#0f1117")
++                self._fv_status.config(text=f"✔  Saved → {path}")
++
++
+     # ── Run ──────────────────────────────────────────────────────────────────
+     app = MotorDesignApp()
+     app.mainloop()
+diff --git a/Bohemien_Motor_Designer/tests/__init__.py b/Bohemien_Motor_Designer/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/Bohemien_Motor_Designer/tests/test_inductance_reconciliation.py b/Bohemien_Motor_Designer/tests/test_inductance_reconciliation.py
+new file mode 100644
+index 0000000..2726907
+--- /dev/null
++++ b/Bohemien_Motor_Designer/tests/test_inductance_reconciliation.py
+@@ -0,0 +1,212 @@
++"""
++Inductance reconciliation tests: analytical vs 2D FEM vs 3D FEM.
++
++Run:
++    python -m pytest Bohemien_Motor_Designer/tests -v         (from repo root)
++    python Bohemien_Motor_Designer/tests/test_inductance_reconciliation.py
++
++Every assertion below encodes a relation that was broken before the
++Nov-2026 fixes and is now verified on the reference 8p/48s 30 kW SPM:
++
++  T1  winding bookkeeping  : N_series = coils_per_phase × N_coil / a   (was /2 low)
++  T2  analytical breakdown : L_2d = L_ag + L_h + L_slot + L_tt,  L_ew ≈ 5–30 % of total
++  T3  2D energy check      : Ld(flux linkage) == Ld(stored energy)      (was ×1/ff off)
++  T4  2D SPM symmetry      : Lq/Ld ≈ 1 (0.85–1.05)                      (was 1.6–1.9)
++  T5  2D vs analytical     : Ke_fem/Ke_anal ≈ 1 ±3 %;  Ld_2d/L_2d_anal ≈ 1 ±8 %
++  T6  3D mesh conformity   : no interior crack faces                    (was 75 % cracked)
++  T7  3D energy check      : Ld(flux linkage) == Ld(stored energy)      (gauge invariance)
++  T8  3D vs 2D             : Ke_3d/Ke_2d and Ld_3d/Ld_2d within ±4 %    (was >10×)
++
++Total run time ≈ 60 s (the 3D cases dominate).  Mesh densities are the
++smallest that give the quoted tolerances; tighten the meshes, not the
++tolerances, if you want a stricter test.
++"""
++from __future__ import annotations
++import sys, os, time
++import numpy as np
++
++# Make the package importable whether run from repo root or elsewhere
++_HERE = os.path.dirname(os.path.abspath(__file__))
++_PKG  = os.path.dirname(_HERE)
++_ROOT = os.path.dirname(_PKG)
++for p in (_ROOT, _PKG):
++    if p not in sys.path:
++        sys.path.insert(0, p)
++
++_PKGNAME = os.path.basename(_PKG)
++import importlib
++_core   = importlib.import_module(f"{_PKGNAME}.core.pmsm")
++_stat   = importlib.import_module(f"{_PKGNAME}.core.geometry.stator")
++_slot   = importlib.import_module(f"{_PKGNAME}.core.geometry.slot_profiles")
++_rot    = importlib.import_module(f"{_PKGNAME}.core.geometry.rotor")
++_wind   = importlib.import_module(f"{_PKGNAME}.core.geometry.winding")
++_mesh2  = importlib.import_module(f"{_PKGNAME}.fea.py_mesh")
++_sol2   = importlib.import_module(f"{_PKGNAME}.fea.py_solver")
++_tq2    = importlib.import_module(f"{_PKGNAME}.fea.py_torque")
++_mesh3  = importlib.import_module(f"{_PKGNAME}.fea.mesh3d")
++_sol3   = importlib.import_module(f"{_PKGNAME}.fea.solver3d")
++_run3   = importlib.import_module(f"{_PKGNAME}.fea.runner3d")
++_run2   = importlib.import_module(f"{_PKGNAME}.fea.py_runner")
++
++
++# ── Reference motor ──────────────────────────────────────────────────────────
++
++def reference_motor(turns_per_coil: int = 1):
++    """8p/48s, 30 kW, 4000 rpm, 400 V SPM.  N_series = 16 × turns_per_coil."""
++    slot = _slot.ParallelToothSlot(slot_width=0.0080, slot_depth=0.0240,
++                                   slot_opening=0.0030, wedge_height=0.0010)
++    stator = _stat.StatorGeometry(outer_radius=0.1125, inner_radius=0.082,
++                                  slots=48, slot_profile=slot, lamination="M270-35A")
++    rotor_geo = _rot.SPMRotorGeometry(outer_radius=0.081, inner_radius=0.030,
++                                      magnet_thickness=0.006, magnet_width_fraction=0.83,
++                                      magnet_material="N42SH")
++    winding = _wind.WindingLayout(poles=8, slots=48, phases=3, layers=2,
++                                  turns_per_coil=turns_per_coil, parallel_paths=1)
++    return _core.PMSM(poles=8, slots=48, stator=stator, rotor_geo=rotor_geo,
++                      rotor_outer_radius=0.081, rotor_inner_radius=0.030,
++                      stack_length=0.130, airgap=0.001,
++                      rated_speed=4000.0, rated_power=30000.0,
++                      magnet_material="N42SH", magnet_thickness=0.006,
++                      magnet_width_fraction=0.83, turns_per_coil=turns_per_coil,
++                      conductor_diameter=0.0009, slot_fill_factor=0.48,
++                      parallel_paths=1, winding=winding)
++
++
++def _park(psi, th):
++    c = 2.0 / 3.0
++    A, B, C = psi["psi_A"], psi["psi_B"], psi["psi_C"]
++    pd = c * (A*np.cos(th) + B*np.cos(th - 2*np.pi/3) + C*np.cos(th + 2*np.pi/3))
++    pq = c * (-A*np.sin(th) - B*np.sin(th - 2*np.pi/3) - C*np.sin(th + 2*np.pi/3))
++    return pd, pq
++
++
++# ── T1: winding bookkeeping ──────────────────────────────────────────────────
++
++def test_T1_series_turns_match_coil_side_count():
++    m = reference_motor(2)
++    w = m.winding
++    sides = w.coil_sides_for_phase(0)
++    # Each coil has 2 sides; the layout lists every side with N_coil turns
++    coils_per_phase = len(sides) // 2
++    assert coils_per_phase == w.coils_per_phase == 16
++    assert w.total_series_turns_per_phase == coils_per_phase * w.turns_per_coil == 32
++    assert reference_motor(1).total_series_turns == 16
++
++
++# ── T2: analytical decomposition ─────────────────────────────────────────────
++
++def test_T2_analytical_breakdown():
++    m = reference_motor(1)
++    b = m.inductance_breakdown()
++    assert abs(b["L_2d"] - (b["L_ag"] + b["L_h"] + b["L_slot"] + b["L_tt"])) < 1e-15
++    assert abs(b["L_total"] - (b["L_2d"] + b["L_ew"])) < 1e-15
++    assert 0.03 <= b["L_ew_fraction"] <= 0.35, b["L_ew_fraction"]
++    assert abs(m.Ld - b["L_total"]) < 1e-12          # property uses the same components
++    # Corrected prefactor: (6/π²)·μ0·(N kw)²·τ_p·L/(p·g_c).  Sanity band from
++    # independent derivation (Hendershot & Miller / Pyrhönen): 0.055–0.065 mH
++    assert 0.055e-3 <= b["L_ag"] <= 0.065e-3, b["L_ag"]
++
++
++# ── T3/T4/T5: 2D FEM ─────────────────────────────────────────────────────────
++
++def _solve_2d(m, n_ang=12, n_ag=8):
++    mesh = _mesh2.build_motor_mesh(m, n_radial_airgap=n_ag, n_angular_per_slot=n_ang)
++    Az0  = _sol2.solve_magnetostatic(mesh, m, rotor_angle=0.0, Id=0.0, Iq=0.0, electrical_angle=0.0)
++    pd0, pq0 = _park(_tq2.compute_flux_linkage(mesh, Az0, m), 0.0)
++    th_e = -np.arctan2(-pq0, pd0)
++    Ke   = float(np.hypot(pd0, pq0))
++    dI   = 20.0
++    Az_d = _sol2.solve_magnetostatic(mesh, m, rotor_angle=0.0, Id=dI, Iq=0.0, electrical_angle=th_e)
++    Az_q = _sol2.solve_magnetostatic(mesh, m, rotor_angle=0.0, Id=0.0, Iq=dI, electrical_angle=th_e)
++    pdd, _ = _park(_tq2.compute_flux_linkage(mesh, Az_d, m), th_e)
++    _, pqq = _park(_tq2.compute_flux_linkage(mesh, Az_q, m), th_e)
++    return dict(mesh=mesh, Ke=Ke, Ld=(pdd - Ke)/dI, Lq=pqq/dI, th_e=th_e)
++
++
++def test_T3_2d_energy_method_matches_flux_linkage():
++    m = reference_motor(1)
++    mesh = _mesh2.build_motor_mesh(m, n_radial_airgap=4, n_angular_per_slot=8)
++    m._get_Br = lambda: 0.0                                   # PM off
++    I  = 20.0
++    Az = _sol2.solve_magnetostatic(mesh, m, rotor_angle=0.0, Id=I, Iq=0.0, electrical_angle=0.0)
++    pd, _ = _park(_tq2.compute_flux_linkage(mesh, Az, m), 0.0)
++    geom = _sol2._precompute_geometry(mesh.nodes, mesh.elems)
++    nu   = _sol2._build_nu(mesh.tags, m, mesh)
++    Bx, By, _ = _sol2.compute_B_field(mesh, Az)
++    W  = 0.5 * np.sum(nu * (Bx**2 + By**2) * np.abs(geom["area"])) * m.stack_length
++    del m._get_Br
++    Ld_fl, Ld_en = pd / I, 4.0 * W / (3.0 * I**2)
++    assert abs(Ld_fl / Ld_en - 1.0) < 1e-3, (Ld_fl, Ld_en)
++
++
++def test_T4_T5_2d_vs_analytical():
++    m = reference_motor(1)
++    r = _solve_2d(m, n_ang=12, n_ag=8)
++    b = m.inductance_breakdown()
++    assert 0.85 <= r["Lq"] / r["Ld"] <= 1.05, "SPM must have Lq ≈ Ld (inter-pole gap is air)"
++    assert abs(r["Ke"] / m.back_emf_constant() - 1.0) < 0.03, r["Ke"]
++    assert abs(r["Ld"] / b["L_2d"] - 1.0) < 0.08, (r["Ld"], b["L_2d"])
++
++
++def test_T5b_2d_runner_reports_corrections():
++    m = reference_motor(1)
++    runner = _run2.PythonFEARunner(m, n_radial_airgap=8, n_ang_per_slot=12)
++    res = runner.run_loaded(n_steps=4)
++    for k in ("L_ew_mH", "Ld_total_mH", "L_2d_anal_mH", "L_total_anal_mH", "conv_ratio"):
++        assert k in res, k
++    assert res["conv_converged"], res["conv_ratio"]
++    assert abs(res["Ld_total_mH"] - (res["Ld_mH"] + res["L_ew_mH"])) < 1e-9
++
++
++# ── T6/T7/T8: 3D FEM ─────────────────────────────────────────────────────────
++
++def test_T6_3d_mesh_is_conforming():
++    m = reference_motor(1)
++    mesh = _mesh3.build_motor_mesh_3d(m, n_angular_per_slot=4, n_axial=2,
++                                      n_radial_airgap=3, n_end_winding=1)
++    t = mesh.tets
++    faces = np.sort(np.concatenate([t[:, [0,1,2]], t[:, [0,1,3]], t[:, [0,2,3]], t[:, [1,2,3]]]), axis=1)
++    u, cnt = np.unique(faces, axis=0, return_counts=True)
++    assert cnt.max() == 2
++    r = np.hypot(mesh.nodes[u, 0], mesh.nodes[u, 1]); z = mesh.nodes[u, 2]
++    R_so = m.stator.outer_radius; R_sh = m.rotor_inner_radius
++    on_bnd = ((r.min(axis=1) > R_so*0.999) | (r.max(axis=1) < R_sh*1.001) |
++              np.all(z < mesh.nodes[:, 2].min() + 1e-9, axis=1) |
++              np.all(z > mesh.nodes[:, 2].max() - 1e-9, axis=1))
++    cracks = int(((cnt == 1) & ~on_bnd).sum())
++    assert cracks == 0, f"{cracks} interior crack faces — checkerboard tet split broken"
++    vol = _sol3._precompute_geometry(mesh)["vol"]
++    assert (vol > 0).all()
++
++
++def test_T7_T8_3d_energy_check_and_3d_vs_2d():
++    m = reference_motor(1)
++    r2 = _solve_2d(m, n_ang=8, n_ag=8)
++    runner = _run3.FEMRunner3D(m, n_angular_per_slot=8, n_axial=2,
++                               n_radial_airgap=8, n_end_winding=0)
++    runner.build_mesh()
++    r3 = runner.run_static()
++    # T7: gauge-invariant energy method agrees with extended-conductor flux linkage
++    assert abs(r3["Ld_energy_check"] - 1.0) < 2e-3, r3["Ld_energy_check"]
++    # T8: pure extrusion reproduces 2D at the same mesh density
++    assert abs(r3["Ke_3d"] / r2["Ke"] - 1.0) < 0.04, (r3["Ke_3d"], r2["Ke"])
++    assert abs(r3["Ld_mH"] / (r2["Ld"] * 1e3) - 1.0) < 0.04, (r3["Ld_mH"], r2["Ld"] * 1e3)
++    assert abs(r3["Lq_mH"] / (r2["Lq"] * 1e3) - 1.0) < 0.04, (r3["Lq_mH"], r2["Lq"] * 1e3)
++    assert r3["end_region_model"].startswith("none")
++
++
++# ── Script entry point (no pytest needed) ────────────────────────────────────
++
++if __name__ == "__main__":
++    tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
++    failed = 0
++    for name, fn in tests:
++        t0 = time.time()
++        try:
++            fn(); print(f"PASS  {name}  ({time.time()-t0:.1f}s)")
++        except AssertionError as e:
++            failed += 1; print(f"FAIL  {name}: {e}")
++        except Exception as e:
++            failed += 1; print(f"ERROR {name}: {type(e).__name__}: {e}")
++    print(f"\n{len(tests)-failed}/{len(tests)} passed")
++    sys.exit(1 if failed else 0)

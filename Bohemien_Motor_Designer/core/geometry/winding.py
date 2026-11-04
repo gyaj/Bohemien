@@ -224,13 +224,19 @@ class WindingLayout:
     @property
     def total_series_turns_per_phase(self) -> int:
         """Total series turns per phase [turns].
-        Each slot has one going coil side per phase. Coils are series/parallel_paths.
-        For 2-layer: each slot contributes 1 coil side (going), return is in another slot.
+
+        _build() appends one coil-side per slot per layer, so the coil table
+        holds slots*layers coil-sides.  Two coil-sides (go + return) form one
+        coil, hence coils_per_phase = slots*layers / (2*phases):
+
+          layers=1 -> slots/(2*phases) coils per phase
+          layers=2 -> slots/phases     coils per phase
+
+        The previous form hard-coded the single-layer denominator while
+        ignoring self.layers, halving N for every 2-layer winding.
         """
-        # Number of coils per phase = slots / phases  (one coil-side per slot per layer,
-        # but each coil occupies 2 slots so coils_per_phase = slots/phases/layers * layers = slots/phases)
-        coils_per_phase = self.slots // self.phases
-        return (coils_per_phase * self.turns_per_coil) // (self.parallel_paths * 2)
+        coils_per_phase = (self.slots * self.layers) // (2 * self.phases)
+        return (coils_per_phase * self.turns_per_coil) // self.parallel_paths
 
     # ── Diagnostics ──────────────────────────────────────────────────────
 

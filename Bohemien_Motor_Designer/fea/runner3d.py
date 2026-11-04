@@ -187,13 +187,14 @@ class FEMRunner3D:
         # field weakening and saliency — this is the physically correct value.
         _log("3D FEM: Ld/Lq perturbation (2 solves, zero-background)...", 0.50)
 
-        # Choose dI to give ~5% of Ke as flux change: dI = 0.05*Ke / Ld_est
-        # Use analytical Ld as the estimate to size dI appropriately.
-        Ld_est = max(getattr(motor, 'Ld', 1e-4), 1e-5)
-        dI     = max(0.05 * Ke_3d / Ld_est, 1.0)
-        # Cap at rated current to avoid nonlinear saturation
-        I_rated_est = motor.rated_power / (3 * 200 + 1)  # rough peak current
-        dI = min(dI, I_rated_est)
+        # # Choose dI to give ~5% of Ke as flux change: dI = 0.05*Ke / Ld_est
+        # # Use analytical Ld as the estimate to size dI appropriately.
+        # Ld_est = max(getattr(motor, 'Ld', 1e-4), 1e-5)
+        # dI     = max(0.05 * Ke_3d / Ld_est, 1.0)
+        # # Cap at rated current to avoid nonlinear saturation
+        # I_rated_est = motor.rated_power / (3 * 200 + 1)  # rough peak current
+        # dI = min(dI, I_rated_est)
+        dI = 20.0
         th_e_pert = rotor_angle * pp - theta_w   # d-axis aligned frame
 
         def _psi_dq_zero(Id_, Iq_):
